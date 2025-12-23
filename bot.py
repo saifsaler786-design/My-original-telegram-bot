@@ -1,9 +1,8 @@
 import os
-import time
 import asyncio
 import logging
 from aiohttp import web
-from pyrogram import Client, filters, enums
+from pyrogram import Client, filters
 
 # --- CONFIGURATION (Environment Variables se values lega) ---
 API_ID = int(os.environ.get("API_ID", "0")) 
@@ -16,6 +15,7 @@ PORT = int(os.environ.get("PORT", "8080"))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- BOT CLIENT SETUP ---
 app = Client(
     "my_bot",
     api_id=API_ID,
@@ -23,15 +23,15 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
+# 1 MiB chunks (Pyrogram stream_media isi size me data deta hai)
+CHUNK_SIZE = 1024 * 1024
+
 # --- WEB SERVER ROUTES ---
 async def handle_stream(request):
-    """
-    Yeh function Range Requests support karta hai - Forward/Backward kaam karega!
-    """
     try:
-        message_id = int(request.match_info['message_id'])
+        message_id = int(request.match_info["message_id"])
         msg = await app.get_messages(CHANNEL_ID, message_id)
-        
+
         if not msg or not msg.media:
             return web.Response(text="File not found or deleted.", status=404)
 
@@ -40,77 +40,91 @@ async def handle_stream(request):
         mime_type = "application/octet-stream"
 
         if msg.document:
-            file_name = msg.document.file_name
-            file_size = msg.document.file_size
-            mime_type = msg.document.mime_type
+            file_name = msg.document.file_name or "file"
+            file_size = msg.document.file_size or 0
+            mime_type = msg.document.mime_type or "application/octet-stream"
         elif msg.video:
             file_name = msg.video.file_name or "video.mp4"
-            file_size = msg.video.file_size
-            mime_type = msg.video.mime_type
+            file_size = msg.video.file_size or 0
+            mime_type = msg.video.mime_type or "video/mp4"
         elif msg.audio:
             file_name = msg.audio.file_name or "audio.mp3"
-            file_size = msg.audio.file_size
-            mime_type = msg.audio.mime_type
+            file_size = msg.audio.file_size or 0
+            mime_type = msg.audio.mime_type or "audio/mpeg"
 
-        # --- RANGE REQUEST HANDLING (Video Seeking ke liye) ---
-        range_header = request.headers.get('Range', None)
-        
+        if not file_size:
+            return web.Response(text="Invalid file size.", status=500)
+
+        range_header = request.headers.get("Range")
         start = 0
         end = file_size - 1
-        
-        if range_header:
-            # Parse Range header (e.g., "bytes=1000-2000")
-            range_str = range_header.replace('bytes=', '')
-            range_parts = range_str.split('-')
-            
-            start = int(range_parts[0]) if range_parts[0] else 0
-            end = int(range_parts[1]) if range_parts[1] else file_size - 1
-            
-            # Validate range
-            if start >= file_size:
-                return web.Response(status=416, text="Range Not Satisfiable")
-            if end >= file_size:
-                end = file_size - 1
+        status = 200
 
-        content_length = end - start + 1
-        
-        # Headers for Range Response
+        if range_header:
+            try:
+                units, rng = range_header.strip().split("=", 1)
+                if units != "bytes":
+                    raise ValueError("Invalid range unit")
+
+                start_s, end_s = rng.split("-", 1)
+                if start_s == "" and end_s:
+                    suffix = int(end_s)
+                    start = max(file_size - suffix, 0)
+                    end = file_size - 1
+                else:
+                    start = int(start_s) if start_s else 0
+                    end = int(end_s) if end_s else file_size - 1
+
+                if start >= file_size or start < 0 or end < start:
+                    return web.Response(
+                        status=416,
+                        headers={"Content-Range": f"bytes */{file_size}"},
+                        text="Requested Range Not Satisfiable",
+                    )
+
+                status = 206
+            except Exception:
+                start = 0
+                end = file_size - 1
+                status = 200
+
         headers = {
-            'Content-Type': mime_type,
-            'Content-Disposition': f'inline; filename="{file_name}"',
-            'Content-Length': str(content_length),
-            'Accept-Ranges': 'bytes',
-            'Content-Range': f'bytes {start}-{end}/{file_size}'
+            "Content-Type": mime_type,
+            "Content-Disposition": f'inline; filename="{file_name}"',
+            "Accept-Ranges": "bytes",
         }
 
-        # 206 Partial Content for Range, 200 for Full
-        status_code = 206 if range_header else 200
-        
-        resp = web.StreamResponse(status=status_code, headers=headers)
+        if status == 206:
+            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+            headers["Content-Length"] = str(end - start + 1)
+        else:
+            headers["Content-Length"] = str(file_size)
+
+        logger.info(f"STREAM id={message_id} range={range_header} start={start} end={end} status={status}")
+
+        resp = web.StreamResponse(status=status, headers=headers)
         await resp.prepare(request)
 
-        # Stream with offset support
-        current_pos = 0
-        async for chunk in app.stream_media(msg):
-            chunk_start = current_pos
-            chunk_end = current_pos + len(chunk) - 1
-            
-            # Skip chunks before start
-            if chunk_end < start:
-                current_pos += len(chunk)
-                continue
-            
-            # Stop if past end
-            if chunk_start > end:
-                break
-            
-            # Calculate which part of chunk to send
-            send_start = max(0, start - chunk_start)
-            send_end = min(len(chunk), end - chunk_start + 1)
-            
-            await resp.write(chunk[send_start:send_end])
-            current_pos += len(chunk)
-            
+        if request.method == "HEAD":
+            return resp
+
+        start_chunk = start // CHUNK_SIZE
+        end_chunk = end // CHUNK_SIZE
+        limit = end_chunk - start_chunk + 1
+
+        inner_start = start % CHUNK_SIZE
+        inner_end = end % CHUNK_SIZE
+
+        idx = 0
+        async for chunk in app.stream_media(msg, offset=start_chunk, limit=limit):
+            if idx == 0 and inner_start:
+                chunk = chunk[inner_start:]
+            if idx == limit - 1:
+                chunk = chunk[: inner_end + 1]
+            await resp.write(chunk)
+            idx += 1
+
+        await resp.write_eof()
         return resp
 
     except Exception as e:
@@ -121,7 +135,6 @@ async def health_check(request):
     return web.Response(text="Bot is running! 24/7 Service.")
 
 # --- BOT COMMANDS ---
-
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
     await message.reply_text(
