@@ -2,20 +2,19 @@ import os
 import time
 import asyncio
 import logging
+import math
+import re
 from aiohttp import web
 from pyrogram import Client, filters, enums
 
-# --- CONFIGURATION (Environment Variables se values lega) ---
-# Koyeb par yeh variables set karne honge
+# --- CONFIGURATION (Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0")) 
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0")) # Private Channel ID (e.g., -100xxxx)
-
-# Server Port (Koyeb auto-assign karta hai, default 8080)
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0")) 
 PORT = int(os.environ.get("PORT", "8080"))
 
-# Logging setup (Errors dekhne ke liye)
+# Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -30,20 +29,16 @@ app = Client(
 # --- WEB SERVER ROUTES ---
 async def handle_stream(request):
     """
-    Yeh function tab chalega jab koi link open karega.
-    Yeh Telegram se file stream karke user ke browser mein bhejta hai.
+    Handles streaming with support for Range Headers (Forward/Backward capabilities).
     """
     try:
-        # URL se message id nikalo (e.g., /stream/123 -> 123)
         message_id = int(request.match_info['message_id'])
-        
-        # Channel se message fetch karo
         msg = await app.get_messages(CHANNEL_ID, message_id)
         
         if not msg or not msg.media:
             return web.Response(text="File not found or deleted.", status=404)
 
-        # File ki details nikalo
+        # File Details Fetch Karo
         file_name = "file"
         file_size = 0
         mime_type = "application/octet-stream"
@@ -60,21 +55,66 @@ async def handle_stream(request):
             file_name = msg.audio.file_name or "audio.mp3"
             file_size = msg.audio.file_size
             mime_type = msg.audio.mime_type
-            
-        # Headers set karo taake browser samajh sake ye file hai
+
+        # --- RANGE HEADER HANDLING (FORWARD/BACKWARD LOGIC) ---
+        range_header = request.headers.get("Range")
+        
+        # Default values (agar Range header nahi hai to full file)
+        from_bytes = 0
+        until_bytes = file_size - 1
+        status_code = 200
+        content_length = file_size
+
+        # Agar Browser ne specific part manga hai (Range Request)
+        if range_header:
+            try:
+                # Range format: bytes=0-1024 (start-end)
+                ranges = re.findall(r"bytes=(\d+)-(\d*)", range_header)
+                if ranges:
+                    from_bytes = int(ranges[0][0])
+                    if ranges[0][1]:
+                        until_bytes = int(ranges[0][1])
+                    else:
+                        until_bytes = file_size - 1
+                    
+                    # Ensure valid range
+                    if from_bytes >= file_size:
+                         return web.Response(status=416, headers={'Content-Range': f'bytes */{file_size}'})
+
+                    # Calculate length of this chunk
+                    content_length = until_bytes - from_bytes + 1
+                    status_code = 206 # 206 means Partial Content
+            except Exception as e:
+                logger.error(f"Range Error: {e}")
+                # Fallback to full download if range parsing fails
+                from_bytes = 0
+                until_bytes = file_size - 1
+                status_code = 200
+                content_length = file_size
+
+        # Headers set karo
         headers = {
             'Content-Type': mime_type,
             'Content-Disposition': f'inline; filename="{file_name}"',
-            'Content-Length': str(file_size)
+            'Accept-Ranges': 'bytes',
+            'Content-Length': str(content_length),
         }
 
-        # Response stream shuru karo
-        resp = web.StreamResponse(status=200, headers=headers)
+        # Agar 206 (Partial) hai to Content-Range header zaroori hai
+        if status_code == 206:
+            headers['Content-Range'] = f'bytes {from_bytes}-{until_bytes}/{file_size}'
+
+        # Response start karo
+        resp = web.StreamResponse(status=status_code, headers=headers)
         await resp.prepare(request)
 
-        # Telegram se download karke direct user ko stream karo (Chunk by Chunk)
-        # Yeh sabse important part hai free streaming ke liye
-        async for chunk in app.stream_media(msg):
+        # Telegram se specific hissa stream karo using offset
+        # limit calculate karte hain (0 means unlimited in Pyrogram, so we calculate exact amount needed)
+        # Note: Pyrogram stream_media uses 'limit' as amount of bytes, not end position.
+        req_limit = content_length 
+        
+        # Streaming loop
+        async for chunk in app.stream_media(msg, offset=from_bytes, limit=req_limit):
             await resp.write(chunk)
             
         return resp
@@ -94,34 +134,25 @@ async def start(client, message):
         f"👋 Salam **{message.from_user.first_name}**!\n\n"
         "Mujhe koi bhi File ya Video bhejo, main uska **Permanent Direct Link** bana dunga.\n"
         "Ye link Lifetime kaam karega aur free hai.\n\n"
-        "🚀 **Powered by:** Koyeb & Pyrogram"
+        "Ab aap video ko **Forward/Backward** bhi kar sakte hain! ⏩⏪"
     )
 
 @app.on_message((filters.document | filters.video | filters.audio) & filters.private)
 async def file_handler(client, message):
-    """
-    Jab user file bhejta hai:
-    1. File ko Database Channel mein copy karo.
-    2. Wahan se Message ID lo.
-    3. Link generate karo.
-    """
     status_msg = await message.reply_text("⏳ **Processing...**\nFile channel pe upload ho rahi hai...")
 
     try:
-        # File ko private channel mein copy karo (Forward nahi, Copy taake user ID hide rahe)
         log_msg = await message.copy(CHANNEL_ID)
         msg_id = log_msg.id
         
-        # Server ka URL (Koyeb automatically URL assign karta hai, hum environment se bhi le sakte hain)
-        # Local testing ke liye localhost, Production ke liye Koyeb URL
-        # NOTE: Koyeb deploy hone ke baad jo URL milega wo yahan hardcode karna behtar hai
-        # Filhal hum dynamic host use karne ki koshish karte hain, lekin best hai ke APP_URL env var set karein
+        # APP_URL Environment variable se lein, ya Koyeb ka URL yahan daalein
+        # Example: https://myapp-name.koyeb.app
         base_url = os.environ.get("APP_URL", "http://localhost:8080")
         
         stream_link = f"{base_url}/stream/{msg_id}"
         
-        # File size formatting
         file_size_mb = 0
+        fname = "file"
         if message.document:
             file_size_mb = round(message.document.file_size / (1024 * 1024), 2)
             fname = message.document.file_name
@@ -138,8 +169,7 @@ async def file_handler(client, message):
             f"📦 **Size:** `{file_size_mb} MB`\n\n"
             f"🎬 **Stream Link:**\n{stream_link}\n\n"
             f"⬇️ **Download Link:**\n{stream_link}\n\n"
-            "⏰ **Validity:** Lifetime ♾️\n"
-            "⚠️ *Note: Link tab tak chalega jab tak bot ON hai.*"
+            "⚠️ *Link bot ke ON rehne tak chalega.*"
         )
         
         await status_msg.edit_text(response_text, disable_web_page_preview=True)
@@ -150,7 +180,6 @@ async def file_handler(client, message):
 
 # --- MAIN EXECUTION ---
 async def start_services():
-    # Web App Setup
     web_app = web.Application()
     web_app.router.add_get('/stream/{message_id}', handle_stream)
     web_app.router.add_get('/', health_check)
@@ -161,11 +190,9 @@ async def start_services():
     await site.start()
     logger.info(f"🌍 Web Server running on Port {PORT}")
 
-    # Bot Start
     logger.info("🤖 Bot starting...")
     await app.start()
     
-    # Keep running
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
