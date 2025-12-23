@@ -4,9 +4,10 @@ import math
 import logging
 import mimetypes
 import time
+import re
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from pyrogram import Client, errors
+from pyrogram import Client
 from aiohttp import web
 
 # --- CONFIGURATION ---
@@ -17,25 +18,64 @@ CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "-100123456789"))
 PORT = int(os.environ.get("PORT", "8000")) 
 HOST_URL = os.environ.get("HOST_URL", "https://your-app.koyeb.app")
 
-# Logging
-logging.basicConfig(level=logging.INFO)
+# Logging Setup (Debug Mode)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
 # --- PYROGRAM CLIENT ---
-# ipv6=False zaroori hai taki connection fast bane
+# workers=4 rakha hai taaki parallel download ho sake
 pyro_client = Client(
     "stream_bot_session",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
     no_updates=True,
-    ipv6=False 
+    max_concurrent_transmissions=4, 
+    ipv6=False
 )
 
-# --- PTB CLIENT ---
 ptb_app = Application.builder().token(BOT_TOKEN).build()
 
-# --- HELPER: FILE INFO ---
+# --- CUSTOM STREAM CLASS (The Magic Fix) ---
+class ByteStreamer:
+    def __init__(self, client, message):
+        self.client = client
+        self.message = message
+        self.media = message.video or message.document or message.audio
+        self.file_size = self.media.file_size
+
+    async def yield_chunks(self, offset, length):
+        # Yeh function Pyrogram se data maangta hai aur Aiohttp ko deta hai
+        chunk_size = 1024 * 1024 # 1 MB Chunks
+        current_offset = offset
+        bytes_remaining = length
+        
+        while bytes_remaining > 0:
+            fetch_size = min(chunk_size, bytes_remaining)
+            
+            try:
+                # Pyrogram se specific hissa download karo (In-Memory)
+                # Hum generator use kar rahe hain
+                async for chunk in self.client.stream_media(
+                    self.message,
+                    offset=current_offset,
+                    limit=fetch_size
+                ):
+                    yield chunk
+                    current_offset += len(chunk)
+                    bytes_remaining -= len(chunk)
+                    
+                    # Thoda saans lene do server ko
+                    await asyncio.sleep(0)
+                    
+            except Exception as e:
+                logger.error(f"Error yielding chunk: {e}")
+                break
+
+# --- HELPER FUNCTIONS ---
 async def get_file_properties(message):
     media = message.video or message.document or message.audio
     if not media: return None
@@ -44,107 +84,112 @@ async def get_file_properties(message):
     mime_type = getattr(media, "mime_type", mimetypes.guess_type(file_name)[0] or "application/octet-stream")
     return media, file_name, file_size, mime_type
 
-# --- BOT COMMANDS ---
+# --- BOT HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 **Bot Ready!**\nFile bhejo, main Stream Link dunga.")
+    await update.message.reply_text("✅ **Bot Online!** File bhejo.")
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not (msg.document or msg.video or msg.audio): return
-    
     status = await msg.reply_text("🔄 **Processing...**")
     try:
         f_msg = await msg.forward(chat_id=CHANNEL_ID)
         mid = f_msg.message_id
         link = f"{HOST_URL}/watch/{mid}"
         dl_link = f"{HOST_URL}/download/{mid}"
-        
         fname = msg.document.file_name if msg.document else (msg.video.file_name if msg.video else "file")
         
-        text = (
-            f"📄 **File:** `{fname}`\n\n"
-            f"🎬 **Stream:** [Click to Play]({link})\n"
-            f"📥 **Download:** [Click to Download]({dl_link})"
-        )
-        kb = [[InlineKeyboardButton("🎬 Play Now", url=link)]]
+        text = f"📄 `{fname}`\n\n🎬 [Stream]({link})\n⬇️ [Download]({dl_link})"
+        kb = [[InlineKeyboardButton("🎬 Play Video", url=link)]]
         await status.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
     except Exception as e:
         await status.edit_text(f"Error: {e}")
 
-# --- NEW ROBUST STREAMING ENGINE ---
-# Yeh function browser ko data chunks mein bhejta hai
-async def media_streamer(request, mode="inline"):
+# --- WEB HANDLERS ---
+async def stream_handler(request):
     try:
         message_id = int(request.match_info['message_id'])
+        logger.info(f"Request for Message ID: {message_id}")
+        
+        # Message Fetch
         msg = await pyro_client.get_messages(CHANNEL_ID, message_id)
         media, file_name, file_size, mime_type = await get_file_properties(msg)
         
-        # Range Headers Calculation (Video seeking ke liye)
+        # Range Header Check (Browser Playback Logic)
         range_header = request.headers.get("Range")
-        from_bytes, until_bytes = 0, file_size - 1
-        
-        if range_header:
-            from_bytes, until_bytes = range_header.replace("bytes=", "").split("-")
-            from_bytes = int(from_bytes)
-            until_bytes = int(until_bytes) if until_bytes else file_size - 1
+        offset = 0
+        length = file_size
 
-        content_length = (until_bytes - from_bytes) + 1
-        
-        # Response Headers set karna
+        if range_header:
+            # Parse Range: bytes=100-200
+            matches = re.search(r'bytes=(\d+)-(\d*)', range_header)
+            if matches:
+                offset = int(matches.group(1))
+                if matches.group(2):
+                    end_byte = int(matches.group(2))
+                else:
+                    end_byte = file_size - 1
+                length = end_byte - offset + 1
+
+        # Headers setup
         headers = {
-            "Content-Type": mime_type,
-            "Content-Range": f"bytes {from_bytes}-{until_bytes}/{file_size}",
-            "Content-Length": str(content_length),
-            "Content-Disposition": f'{mode}; filename="{file_name}"',
-            "Accept-Ranges": "bytes",
+            'Content-Type': mime_type,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': str(length),
+            'Content-Disposition': f'inline; filename="{file_name}"',
+            'Access-Control-Allow-Origin': '*' # CORS fix
         }
 
-        # StreamResponse create karein (Important fix for buffering)
-        resp = web.StreamResponse(
-            status=206 if range_header else 200,
-            reason='Partial Content' if range_header else 'OK',
-            headers=headers
-        )
+        if range_header:
+            headers['Content-Range'] = f'bytes {offset}-{offset + length - 1}/{file_size}'
+            status_code = 206
+        else:
+            status_code = 200
+
+        # Response start
+        response = web.StreamResponse(status=status_code, headers=headers)
+        await response.prepare(request)
+
+        # Streaming Start
+        logger.info(f"Starting Stream: Offset={offset}, Length={length}")
+        streamer = ByteStreamer(pyro_client, msg)
         
-        # Browser ko batayein hum ready hain
-        await resp.prepare(request)
-        
-        # Pyrogram se data le kar sidha browser ko bhejein
-        # Chunk size 1MB (1024*1024) rakha hai taaki smooth chale
-        async for chunk in pyro_client.stream_media(msg, offset=from_bytes, limit=content_length):
-            await resp.write(chunk)
+        try:
+            async for chunk in streamer.yield_chunks(offset, length):
+                await response.write(chunk)
+        except Exception as e:
+            logger.error(f"Stream Broken: {e}")
             
-        return resp
+        return response
 
     except Exception as e:
-        logger.error(f"Stream Error: {e}")
+        logger.error(f"Handler Error: {e}")
         return web.Response(status=500, text="Server Error")
 
-async def watch_handler(request): return await media_streamer(request, mode="inline")
-async def download_handler(request): return await media_streamer(request, mode="attachment")
-async def health_check(request): return web.Response(text="Bot Alive", status=200)
+async def health_check(request):
+    return web.Response(text="Running", status=200)
 
-# --- BACKGROUND TASKS ---
+# --- BACKGROUND & MAIN ---
 async def on_startup(app):
-    asyncio.create_task(run_bot_logic())
+    asyncio.create_task(run_bots())
 
-async def run_bot_logic():
+async def run_bots():
+    print("🔵 Connecting to Telegram...")
     await pyro_client.start()
-    print("✅ Pyrogram Started")
+    print("✅ Pyrogram Connected!")
     
     ptb_app.add_handler(CommandHandler("start", start))
     ptb_app.add_handler(MessageHandler(filters.Document.ALL | filters.VIDEO | filters.AUDIO, handle_file))
     await ptb_app.initialize()
     await ptb_app.start()
     await ptb_app.updater.start_polling()
-    print("✅ Bot Started")
+    print("✅ Bot Started Polling!")
 
-# --- MAIN ---
 if __name__ == "__main__":
     app = web.Application()
     app.router.add_get("/", health_check)
-    app.router.add_get("/watch/{message_id}", watch_handler)
-    app.router.add_get("/download/{message_id}", download_handler)
+    app.router.add_get("/watch/{message_id}", stream_handler)
+    app.router.add_get("/download/{message_id}", stream_handler)
     app.on_startup.append(on_startup)
     
     print(f"🚀 Server running on Port {PORT}")
