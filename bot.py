@@ -43,7 +43,6 @@ def humanbytes(size):
     return str(round(size, 2)) + " " + Dic_powerN[n] + 'B'
 
 def get_file_info(msg):
-    # Message se basic info nikalna (Name, Size, Mime)
     if msg.document:
         return msg.document.file_size, msg.document.mime_type, msg.document.file_name
     if msg.video:
@@ -53,37 +52,27 @@ def get_file_info(msg):
     return None, None, None
 
 async def get_raw_location(client, channel_id, message_id):
-    # Yeh naya function hai jo DIRECT Raw API use karta hai
-    # FileId string decoding ki zaroorat nahi padegi
     try:
         peer = await client.resolve_peer(channel_id)
-        
-        # Raw API call to get message info directly
-        # Note: Channels ke liye channels.GetMessages use hota hai
         raw_request = functions.channels.GetMessages(
             channel=peer,
             id=[types.InputMessageID(id=message_id)]
         )
-        
         raw_response = await client.invoke(raw_request)
         
         if not raw_response.messages:
             return None
             
         msg = raw_response.messages[0]
-        
-        # Media check karein
         media = None
         if isinstance(msg.media, types.MessageMediaDocument):
             media = msg.media.document
         elif isinstance(msg.media, types.MessageMediaPhoto):
-            return None # Photo streaming not supported same way
+            return None 
             
         if not media:
             return None
 
-        # InputDocumentFileLocation construct karein
-        # Yeh 100% accurate location deta hai
         location = types.InputDocumentFileLocation(
             id=media.id,
             access_hash=media.access_hash,
@@ -98,12 +87,10 @@ async def get_raw_location(client, channel_id, message_id):
 
 # --- STREAMING GENERATOR ---
 async def chunk_generator(client, location, offset, limit):
-    chunk_size = 1024 * 1024  # 1 MB Chunk
-    
+    chunk_size = 1024 * 1024 
     while limit > 0:
         to_read = min(limit, chunk_size)
         try:
-            # Direct MTProto Call
             result = await client.invoke(
                 functions.upload.GetFile(
                     location=location,
@@ -111,16 +98,12 @@ async def chunk_generator(client, location, offset, limit):
                     limit=to_read
                 )
             )
-            
             yield result.bytes
-            
             read_len = len(result.bytes)
             offset += read_len
             limit -= read_len
-            
             if read_len < to_read:
                 break
-                
         except Exception as e:
             logger.error(f"Chunk Error: {e}")
             break
@@ -131,37 +114,32 @@ routes = web.RouteTableDef()
 
 @routes.get("/")
 async def root_route_handler(request):
-    return web.json_response({"status": "running", "maintainer": "YourName"})
+    return web.json_response({"status": "running"})
 
 @routes.get("/stream/{message_id}")
 async def stream_handler(request):
     try:
-        message_id_str = request.match_info['message_id']
         try:
-            message_id = int(message_id_str)
+            message_id = int(request.match_info['message_id'])
         except ValueError:
              return web.Response(status=400, text="Invalid Message ID")
         
-        # 1. Message info layen (for Name & Size)
-        # Hum high-level API use kar rahe hain sirf metadata ke liye
         msg = await bot.get_messages(CHANNEL_ID, message_id)
         if not msg:
              return web.Response(status=404, text="Message Not Found")
         
         file_size, mime_type, file_name = get_file_info(msg)
         if not file_size:
-            return web.Response(status=404, text="Media Not Found in Message")
+            return web.Response(status=404, text="Media Not Found")
 
-        # 2. RAW Location nikalein (Isme ab error nahi ayega)
         location = await get_raw_location(bot, CHANNEL_ID, message_id)
         if not location:
              return web.Response(status=500, text="Failed to retrieve file location")
 
-        # 3. Range Header (Seeking)
         range_header = request.headers.get('Range', None)
         from_bytes, until_bytes = 0, file_size - 1
-        
         status_code = 200
+        
         if range_header:
             try:
                 from_bytes, until_bytes_str = range_header.replace("bytes=", "").split("-")
@@ -173,16 +151,17 @@ async def stream_handler(request):
 
         length = until_bytes - from_bytes + 1
         
-        # 4. Response Headers
+        # --- IMPORTANT CHANGE HERE ---
+        # "inline" ka matlab hai browser mein play karo
+        # "attachment" ka matlab hai download karo
         headers = {
             'Content-Type': mime_type,
             'Content-Range': f'bytes {from_bytes}-{until_bytes}/{file_size}',
             'Content-Length': str(length),
-            'Content-Disposition': f'attachment; filename="{file_name}"',
+            'Content-Disposition': f'inline; filename="{file_name}"', 
             'Accept-Ranges': 'bytes',
         }
 
-        # 5. Return Stream
         return web.Response(
             status=status_code,
             body=chunk_generator(bot, location, from_bytes, length),
@@ -198,9 +177,7 @@ async def stream_handler(request):
 @bot.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message):
     await message.reply_text(
-        "👋 **Hello! Main Free Stream Bot hun.**\n\n"
-        "Mujhe koi Video bhejo, main uska **Direct Link** bana dunga.\n"
-        "Link se video **Play** bhi hogi aur **Download** bhi!",
+        "👋 **Hello!**\nFile bhejo, main Stream Link dunga.",
         quote=True
     )
 
@@ -208,24 +185,20 @@ async def start_handler(client, message):
 async def file_handler(client, message):
     status_msg = await message.reply_text("🔄 **Processing...**", quote=True)
     try:
-        # File ko Channel mein copy karein
         channel_msg = await message.copy(CHANNEL_ID)
-        
         stream_link = f"{BASE_URL}/stream/{channel_msg.id}"
-        
         f_size_bytes, mime, fname = get_file_info(message)
         f_size = humanbytes(f_size_bytes)
         
         text = (
             "✅ **File Ready!**\n\n"
-            f"📄 **Name:** `{fname}`\n"
-            f"📦 **Size:** `{f_size}`\n\n"
-            f"🎬 **Stream:**\n`{stream_link}`\n\n"
-            f"⬇️ **Download:**\n`{stream_link}`"
+            f"📄 `{fname}`\n"
+            f"📦 `{f_size}`\n\n"
+            f"🎬 **Stream / Download Link:**\n`{stream_link}`"
         )
         
         buttons = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎬 Watch Now", url=stream_link)],
+            [InlineKeyboardButton("🎬 Play Video", url=stream_link)],
             [InlineKeyboardButton("⬇️ Download", url=stream_link)]
         ])
 
@@ -244,11 +217,8 @@ async def start_services():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logger.info(f"Web Server Running on Port {PORT}")
-
-    await bot.start()
-    logger.info("Bot Started!")
     
+    await bot.start()
     from pyrogram import idle
     await idle()
     await bot.stop()
