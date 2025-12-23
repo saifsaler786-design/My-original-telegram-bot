@@ -6,20 +6,16 @@ from aiohttp import web
 from pyrogram import Client, filters, enums
 
 # --- CONFIGURATION (Environment Variables se values lega) ---
-# Koyeb par yeh variables set karne honge
 API_ID = int(os.environ.get("API_ID", "0")) 
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0")) # Private Channel ID (e.g., -100xxxx)
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))
 
-# Server Port (Koyeb auto-assign karta hai, default 8080)
 PORT = int(os.environ.get("PORT", "8080"))
 
-# Logging setup (Errors dekhne ke liye)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- BOT CLIENT SETUP ---
 app = Client(
     "my_bot",
     api_id=API_ID,
@@ -30,20 +26,15 @@ app = Client(
 # --- WEB SERVER ROUTES ---
 async def handle_stream(request):
     """
-    Yeh function tab chalega jab koi link open karega.
-    Yeh Telegram se file stream karke user ke browser mein bhejta hai.
+    Yeh function Range Requests support karta hai - Forward/Backward kaam karega!
     """
     try:
-        # URL se message id nikalo (e.g., /stream/123 -> 123)
         message_id = int(request.match_info['message_id'])
-        
-        # Channel se message fetch karo
         msg = await app.get_messages(CHANNEL_ID, message_id)
         
         if not msg or not msg.media:
             return web.Response(text="File not found or deleted.", status=404)
 
-        # File ki details nikalo
         file_name = "file"
         file_size = 0
         mime_type = "application/octet-stream"
@@ -60,22 +51,65 @@ async def handle_stream(request):
             file_name = msg.audio.file_name or "audio.mp3"
             file_size = msg.audio.file_size
             mime_type = msg.audio.mime_type
+
+        # --- RANGE REQUEST HANDLING (Video Seeking ke liye) ---
+        range_header = request.headers.get('Range', None)
+        
+        start = 0
+        end = file_size - 1
+        
+        if range_header:
+            # Parse Range header (e.g., "bytes=1000-2000")
+            range_str = range_header.replace('bytes=', '')
+            range_parts = range_str.split('-')
             
-        # Headers set karo taake browser samajh sake ye file hai
+            start = int(range_parts[0]) if range_parts[0] else 0
+            end = int(range_parts[1]) if range_parts[1] else file_size - 1
+            
+            # Validate range
+            if start >= file_size:
+                return web.Response(status=416, text="Range Not Satisfiable")
+            if end >= file_size:
+                end = file_size - 1
+
+        content_length = end - start + 1
+        
+        # Headers for Range Response
         headers = {
             'Content-Type': mime_type,
             'Content-Disposition': f'inline; filename="{file_name}"',
-            'Content-Length': str(file_size)
+            'Content-Length': str(content_length),
+            'Accept-Ranges': 'bytes',
+            'Content-Range': f'bytes {start}-{end}/{file_size}'
         }
 
-        # Response stream shuru karo
-        resp = web.StreamResponse(status=200, headers=headers)
+        # 206 Partial Content for Range, 200 for Full
+        status_code = 206 if range_header else 200
+        
+        resp = web.StreamResponse(status=status_code, headers=headers)
         await resp.prepare(request)
 
-        # Telegram se download karke direct user ko stream karo (Chunk by Chunk)
-        # Yeh sabse important part hai free streaming ke liye
+        # Stream with offset support
+        current_pos = 0
         async for chunk in app.stream_media(msg):
-            await resp.write(chunk)
+            chunk_start = current_pos
+            chunk_end = current_pos + len(chunk) - 1
+            
+            # Skip chunks before start
+            if chunk_end < start:
+                current_pos += len(chunk)
+                continue
+            
+            # Stop if past end
+            if chunk_start > end:
+                break
+            
+            # Calculate which part of chunk to send
+            send_start = max(0, start - chunk_start)
+            send_end = min(len(chunk), end - chunk_start + 1)
+            
+            await resp.write(chunk[send_start:send_end])
+            current_pos += len(chunk)
             
         return resp
 
@@ -99,28 +133,15 @@ async def start(client, message):
 
 @app.on_message((filters.document | filters.video | filters.audio) & filters.private)
 async def file_handler(client, message):
-    """
-    Jab user file bhejta hai:
-    1. File ko Database Channel mein copy karo.
-    2. Wahan se Message ID lo.
-    3. Link generate karo.
-    """
     status_msg = await message.reply_text("⏳ **Processing...**\nFile channel pe upload ho rahi hai...")
 
     try:
-        # File ko private channel mein copy karo (Forward nahi, Copy taake user ID hide rahe)
         log_msg = await message.copy(CHANNEL_ID)
         msg_id = log_msg.id
         
-        # Server ka URL (Koyeb automatically URL assign karta hai, hum environment se bhi le sakte hain)
-        # Local testing ke liye localhost, Production ke liye Koyeb URL
-        # NOTE: Koyeb deploy hone ke baad jo URL milega wo yahan hardcode karna behtar hai
-        # Filhal hum dynamic host use karne ki koshish karte hain, lekin best hai ke APP_URL env var set karein
         base_url = os.environ.get("APP_URL", "http://localhost:8080")
-        
         stream_link = f"{base_url}/stream/{msg_id}"
         
-        # File size formatting
         file_size_mb = 0
         if message.document:
             file_size_mb = round(message.document.file_size / (1024 * 1024), 2)
@@ -150,7 +171,6 @@ async def file_handler(client, message):
 
 # --- MAIN EXECUTION ---
 async def start_services():
-    # Web App Setup
     web_app = web.Application()
     web_app.router.add_get('/stream/{message_id}', handle_stream)
     web_app.router.add_get('/', health_check)
@@ -161,13 +181,12 @@ async def start_services():
     await site.start()
     logger.info(f"🌍 Web Server running on Port {PORT}")
 
-    # Bot Start
     logger.info("🤖 Bot starting...")
     await app.start()
     
-    # Keep running
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.run_until_complete(start_services())
+    
