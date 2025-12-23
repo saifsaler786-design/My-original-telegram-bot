@@ -5,19 +5,15 @@ import math
 from aiohttp import web
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.file_id import FileId
-from pyrogram.raw.functions.upload import GetFile
-from pyrogram.raw.types import InputFileLocation
+from pyrogram.raw import functions, types
 
 # --- CONFIGURATION (Environment Variables) ---
-# Environment Variables zaroori hain. 
-# Agar local run kar rahe hain to yahan values dalen, warna Koyeb Env Vars use karega.
 API_ID = int(os.environ.get("API_ID", "12345")) 
 API_HASH = os.environ.get("API_HASH", "your_hash")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token")
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "-100123456789")) 
 BASE_URL = os.environ.get("BASE_URL", "https://your-app.koyeb.app") 
-PORT = int(os.environ.get("PORT", "8000")) # Koyeb ke liye 8000 fix hai
+PORT = int(os.environ.get("PORT", "8000"))
 
 # Logging Setup
 logging.basicConfig(level=logging.INFO)
@@ -37,7 +33,7 @@ bot = Client(
 
 def humanbytes(size):
     if not size:
-        return ""
+        return "0B"
     power = 2**10
     n = 0
     Dic_powerN = {0: ' ', 1: 'Ki', 2: 'Mi', 3: 'Gi', 4: 'Ti'}
@@ -47,50 +43,81 @@ def humanbytes(size):
     return str(round(size, 2)) + " " + Dic_powerN[n] + 'B'
 
 def get_file_info(msg):
-    # Message se file ki info nikalna
+    # Message se basic info nikalna (Name, Size, Mime)
     if msg.document:
-        return msg.document.file_id, msg.document.file_size, msg.document.mime_type, msg.document.file_name
+        return msg.document.file_size, msg.document.mime_type, msg.document.file_name
     if msg.video:
-        return msg.video.file_id, msg.video.file_size, msg.video.mime_type, msg.video.file_name or "video.mp4"
+        return msg.video.file_size, msg.video.mime_type, msg.video.file_name or "video.mp4"
     if msg.audio:
-        return msg.audio.file_id, msg.audio.file_size, msg.audio.mime_type, msg.audio.file_name or "audio.mp3"
-    return None, None, None, None
+        return msg.audio.file_size, msg.audio.mime_type, msg.audio.file_name or "audio.mp3"
+    return None, None, None
 
-async def get_location(file_id):
-    # Pyrogram FileID ko Raw InputFileLocation mein convert karna
-    # Streaming ke liye ye zaroori hai
+async def get_raw_location(client, channel_id, message_id):
+    # Yeh naya function hai jo DIRECT Raw API use karta hai
+    # FileId string decoding ki zaroorat nahi padegi
     try:
-        file_id_obj = FileId.decode(file_id)
-        return file_id_obj.make_to_input_file_location()
+        peer = await client.resolve_peer(channel_id)
+        
+        # Raw API call to get message info directly
+        # Note: Channels ke liye channels.GetMessages use hota hai
+        raw_request = functions.channels.GetMessages(
+            channel=peer,
+            id=[types.InputMessageID(id=message_id)]
+        )
+        
+        raw_response = await client.invoke(raw_request)
+        
+        if not raw_response.messages:
+            return None
+            
+        msg = raw_response.messages[0]
+        
+        # Media check karein
+        media = None
+        if isinstance(msg.media, types.MessageMediaDocument):
+            media = msg.media.document
+        elif isinstance(msg.media, types.MessageMediaPhoto):
+            return None # Photo streaming not supported same way
+            
+        if not media:
+            return None
+
+        # InputDocumentFileLocation construct karein
+        # Yeh 100% accurate location deta hai
+        location = types.InputDocumentFileLocation(
+            id=media.id,
+            access_hash=media.access_hash,
+            file_reference=media.file_reference,
+            thumb_size=""
+        )
+        return location
+
     except Exception as e:
-        logger.error(f"Error making location: {e}")
+        logger.error(f"Raw Location Error: {e}")
         return None
 
-# --- STREAMING GENERATOR (Fix for Error) ---
-# Ye function Telegram se tukdon (chunks) mein file layega
+# --- STREAMING GENERATOR ---
 async def chunk_generator(client, location, offset, limit):
-    chunk_size = 1024 * 1024  # 1 MB Chunk Size
+    chunk_size = 1024 * 1024  # 1 MB Chunk
     
     while limit > 0:
         to_read = min(limit, chunk_size)
         try:
-            # Direct MTProto Call to get file chunk
+            # Direct MTProto Call
             result = await client.invoke(
-                GetFile(
+                functions.upload.GetFile(
                     location=location,
                     offset=offset,
                     limit=to_read
                 )
             )
-            # Yield bytes to browser
+            
             yield result.bytes
             
-            # Update offset
             read_len = len(result.bytes)
             offset += read_len
             limit -= read_len
             
-            # Agar file khatam ho gayi
             if read_len < to_read:
                 break
                 
@@ -109,24 +136,28 @@ async def root_route_handler(request):
 @routes.get("/stream/{message_id}")
 async def stream_handler(request):
     try:
-        message_id = int(request.match_info['message_id'])
+        message_id_str = request.match_info['message_id']
+        try:
+            message_id = int(message_id_str)
+        except ValueError:
+             return web.Response(status=400, text="Invalid Message ID")
         
-        # 1. Get Message from Channel
+        # 1. Message info layen (for Name & Size)
+        # Hum high-level API use kar rahe hain sirf metadata ke liye
         msg = await bot.get_messages(CHANNEL_ID, message_id)
         if not msg:
              return web.Response(status=404, text="Message Not Found")
         
-        # 2. Extract Info
-        file_id, file_size, mime_type, file_name = get_file_info(msg)
-        if not file_id:
+        file_size, mime_type, file_name = get_file_info(msg)
+        if not file_size:
             return web.Response(status=404, text="Media Not Found in Message")
 
-        # 3. Get InputFileLocation for Streaming
-        location = await get_location(file_id)
+        # 2. RAW Location nikalein (Isme ab error nahi ayega)
+        location = await get_raw_location(bot, CHANNEL_ID, message_id)
         if not location:
              return web.Response(status=500, text="Failed to retrieve file location")
 
-        # 4. Handle Range Header (Seeking/Forwarding)
+        # 3. Range Header (Seeking)
         range_header = request.headers.get('Range', None)
         from_bytes, until_bytes = 0, file_size - 1
         
@@ -136,13 +167,13 @@ async def stream_handler(request):
                 from_bytes, until_bytes_str = range_header.replace("bytes=", "").split("-")
                 from_bytes = int(from_bytes)
                 until_bytes = int(until_bytes_str) if until_bytes_str else file_size - 1
-                status_code = 206 # Partial Content
+                status_code = 206
             except ValueError:
                 return web.Response(status=416, text="Invalid Range")
 
         length = until_bytes - from_bytes + 1
         
-        # 5. Set Headers
+        # 4. Response Headers
         headers = {
             'Content-Type': mime_type,
             'Content-Range': f'bytes {from_bytes}-{until_bytes}/{file_size}',
@@ -151,7 +182,7 @@ async def stream_handler(request):
             'Accept-Ranges': 'bytes',
         }
 
-        # 6. Return Stream Response
+        # 5. Return Stream
         return web.Response(
             status=status_code,
             body=chunk_generator(bot, location, from_bytes, length),
@@ -180,11 +211,10 @@ async def file_handler(client, message):
         # File ko Channel mein copy karein
         channel_msg = await message.copy(CHANNEL_ID)
         
-        # Link Banayein
         stream_link = f"{BASE_URL}/stream/{channel_msg.id}"
         
-        file_id, file_size_bytes, mime, fname = get_file_info(message)
-        f_size = humanbytes(file_size_bytes)
+        f_size_bytes, mime, fname = get_file_info(message)
+        f_size = humanbytes(f_size_bytes)
         
         text = (
             "✅ **File Ready!**\n\n"
@@ -208,7 +238,6 @@ async def file_handler(client, message):
 # --- MAIN LOOP ---
 
 async def start_services():
-    # Start Web Server
     app = web.Application()
     app.add_routes(routes)
     runner = web.AppRunner(app)
@@ -217,11 +246,9 @@ async def start_services():
     await site.start()
     logger.info(f"Web Server Running on Port {PORT}")
 
-    # Start Bot
     await bot.start()
     logger.info("Bot Started!")
     
-    # Keep Running
     from pyrogram import idle
     await idle()
     await bot.stop()
