@@ -1,133 +1,172 @@
 import os
+import time
 import asyncio
 import logging
-from pyrogram import Client, filters
 from aiohttp import web
+from pyrogram import Client, filters, enums
 
-# --- CONFIGURATION ---
-API_ID = int(os.environ.get("API_ID"))
-API_HASH = os.environ.get("API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID"))
-PORT = int(os.environ.get("PORT", 8080))
-WEB_URL = os.environ.get("WEB_URL", "").rstrip("/")
+# --- CONFIGURATION (Environment Variables se values lega) ---
+# Koyeb par yeh variables set karne honge
+API_ID = int(os.environ.get("API_ID", "0")) 
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0")) # Private Channel ID (e.g., -100xxxx)
 
-# --- LOGGING ---
+# Server Port (Koyeb auto-assign karta hai, default 8080)
+PORT = int(os.environ.get("PORT", "8080"))
+
+# Logging setup (Errors dekhne ke liye)
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# --- BOT CLIENT ---
-# ipv6=True aur workers=4 speed ke liye zaroori hain
+# --- BOT CLIENT SETUP ---
 app = Client(
-    "my_file_bot",
+    "my_bot",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    ipv6=True, 
-    workers=4
+    bot_token=BOT_TOKEN
 )
 
-# --- WEB SERVER ---
-routes = web.RouteTableDef()
-
-@routes.get("/", allow_head=True)
-async def root_route_handler(request):
-    return web.json_response({"status": "High Speed Bot Running"})
-
-@routes.get("/file/{message_id}", allow_head=True)
-async def stream_handler(request):
+# --- WEB SERVER ROUTES ---
+async def handle_stream(request):
+    """
+    Yeh function tab chalega jab koi link open karega.
+    Yeh Telegram se file stream karke user ke browser mein bhejta hai.
+    """
     try:
+        # URL se message id nikalo (e.g., /stream/123 -> 123)
         message_id = int(request.match_info['message_id'])
-        return await media_streamer(request, message_id)
-    except Exception as e:
-        return web.Response(status=500, text=str(e))
-
-async def media_streamer(request, message_id):
-    try:
-        # File dhoondna
-        msg = await app.get_messages(CHANNEL_ID, message_id)
-        if not msg or not msg.media:
-            return web.Response(status=404, text="File Not Found")
-
-        file = getattr(msg, msg.media.value)
-        filename = getattr(file, "file_name", "Video.mp4")
-        file_size = getattr(file, "file_size", 0)
-        mime_type = getattr(file, "mime_type", "video/mp4")
-    except:
-        return web.Response(status=404, text="File fetch failed")
-
-    headers = {
-        "Content-Type": mime_type,
-        "Accept-Ranges": "bytes",
-        "Content-Disposition": f'inline; filename="{filename}"',
-    }
-
-    # Range Handling (Video Seeking)
-    range_header = request.headers.get("Range")
-    
-    if range_header:
-        from_bytes, until_bytes = range_header.replace("bytes=", "").split("-")
-        from_bytes = int(from_bytes)
-        until_bytes = int(until_bytes) if until_bytes else file_size - 1
         
-        headers["Content-Range"] = f"bytes {from_bytes}-{until_bytes}/{file_size}"
-        headers["Content-Length"] = str(until_bytes - from_bytes + 1)
-        status_code = 206
-    else:
-        from_bytes = 0
-        until_bytes = file_size - 1
-        headers["Content-Length"] = str(file_size)
-        status_code = 200
+        # Channel se message fetch karo
+        msg = await app.get_messages(CHANNEL_ID, message_id)
+        
+        if not msg or not msg.media:
+            return web.Response(text="File not found or deleted.", status=404)
 
-    # Generator: Ismein 1MB ka chunk size rakha hai (Fast Loading)
-    async def file_generator():
-        chunk_size = 1024 * 1024 # 1 MB chunks
-        try:
-            async for chunk in app.stream_media(msg, offset=from_bytes, limit=until_bytes - from_bytes + 1):
-                yield chunk
-        except Exception as e:
-            print(f"Error streaming: {e}")
+        # File ki details nikalo
+        file_name = "file"
+        file_size = 0
+        mime_type = "application/octet-stream"
 
-    return web.Response(
-        status=status_code,
-        headers=headers,
-        body=file_generator()
+        if msg.document:
+            file_name = msg.document.file_name
+            file_size = msg.document.file_size
+            mime_type = msg.document.mime_type
+        elif msg.video:
+            file_name = msg.video.file_name or "video.mp4"
+            file_size = msg.video.file_size
+            mime_type = msg.video.mime_type
+        elif msg.audio:
+            file_name = msg.audio.file_name or "audio.mp3"
+            file_size = msg.audio.file_size
+            mime_type = msg.audio.mime_type
+            
+        # Headers set karo taake browser samajh sake ye file hai
+        headers = {
+            'Content-Type': mime_type,
+            'Content-Disposition': f'inline; filename="{file_name}"',
+            'Content-Length': str(file_size)
+        }
+
+        # Response stream shuru karo
+        resp = web.StreamResponse(status=200, headers=headers)
+        await resp.prepare(request)
+
+        # Telegram se download karke direct user ko stream karo (Chunk by Chunk)
+        # Yeh sabse important part hai free streaming ke liye
+        async for chunk in app.stream_media(msg):
+            await resp.write(chunk)
+            
+        return resp
+
+    except Exception as e:
+        logger.error(f"Stream Error: {e}")
+        return web.Response(text="Link Expired or Server Error", status=500)
+
+async def health_check(request):
+    return web.Response(text="Bot is running! 24/7 Service.")
+
+# --- BOT COMMANDS ---
+
+@app.on_message(filters.command("start") & filters.private)
+async def start(client, message):
+    await message.reply_text(
+        f"👋 Salam **{message.from_user.first_name}**!\n\n"
+        "Mujhe koi bhi File ya Video bhejo, main uska **Permanent Direct Link** bana dunga.\n"
+        "Ye link Lifetime kaam karega aur free hai.\n\n"
+        "🚀 **Powered by:** Koyeb & Pyrogram"
     )
 
-# --- COMMANDS ---
-
-@app.on_message(filters.command("start"))
-async def start(client, message):
-    await message.reply_text("👋 Bot Online Hai! Video Bhejein.")
-
-@app.on_message(filters.document | filters.video | filters.audio)
+@app.on_message((filters.document | filters.video | filters.audio) & filters.private)
 async def file_handler(client, message):
-    status = await message.reply_text("🔄 **Link bana raha hoon...**")
-    try:
-        # DB Channel mein copy karna
-        db_msg = await message.copy(chat_id=CHANNEL_ID)
-        link = f"{WEB_URL}/file/{db_msg.id}"
-        
-        await status.edit_text(
-            f"✅ **Link Ready!**\n\n"
-            f"▶️ [Watch Video]({link})\n"
-            f"⬇️ [Download]({link})",
-            disable_web_page_preview=True
-        )
-    except Exception as e:
-        await status.edit_text(f"❌ Error: {e}")
+    """
+    Jab user file bhejta hai:
+    1. File ko Database Channel mein copy karo.
+    2. Wahan se Message ID lo.
+    3. Link generate karo.
+    """
+    status_msg = await message.reply_text("⏳ **Processing...**\nFile channel pe upload ho rahi hai...")
 
-# --- STARTUP ---
+    try:
+        # File ko private channel mein copy karo (Forward nahi, Copy taake user ID hide rahe)
+        log_msg = await message.copy(CHANNEL_ID)
+        msg_id = log_msg.id
+        
+        # Server ka URL (Koyeb automatically URL assign karta hai, hum environment se bhi le sakte hain)
+        # Local testing ke liye localhost, Production ke liye Koyeb URL
+        # NOTE: Koyeb deploy hone ke baad jo URL milega wo yahan hardcode karna behtar hai
+        # Filhal hum dynamic host use karne ki koshish karte hain, lekin best hai ke APP_URL env var set karein
+        base_url = os.environ.get("APP_URL", "http://localhost:8080")
+        
+        stream_link = f"{base_url}/stream/{msg_id}"
+        
+        # File size formatting
+        file_size_mb = 0
+        if message.document:
+            file_size_mb = round(message.document.file_size / (1024 * 1024), 2)
+            fname = message.document.file_name
+        elif message.video:
+            file_size_mb = round(message.video.file_size / (1024 * 1024), 2)
+            fname = message.video.file_name or "video.mp4"
+        elif message.audio:
+            file_size_mb = round(message.audio.file_size / (1024 * 1024), 2)
+            fname = message.audio.file_name or "audio.mp3"
+            
+        response_text = (
+            "✅ **File Upload Complete!**\n\n"
+            f"📄 **File:** `{fname}`\n"
+            f"📦 **Size:** `{file_size_mb} MB`\n\n"
+            f"🎬 **Stream Link:**\n{stream_link}\n\n"
+            f"⬇️ **Download Link:**\n{stream_link}\n\n"
+            "⏰ **Validity:** Lifetime ♾️\n"
+            "⚠️ *Note: Link tab tak chalega jab tak bot ON hai.*"
+        )
+        
+        await status_msg.edit_text(response_text, disable_web_page_preview=True)
+
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        await status_msg.edit_text(f"❌ Error aaya: {str(e)}")
+
+# --- MAIN EXECUTION ---
 async def start_services():
-    print("🤖 Bot Starting...")
-    await app.start()
-    print("🌍 Server Starting...")
-    runner = web.AppRunner(web.Application())
-    runner.app.add_routes(routes)
+    # Web App Setup
+    web_app = web.Application()
+    web_app.router.add_get('/stream/{message_id}', handle_stream)
+    web_app.router.add_get('/', health_check)
+
+    runner = web.AppRunner(web_app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    from pyrogram import idle
-    await idle()
+    logger.info(f"🌍 Web Server running on Port {PORT}")
+
+    # Bot Start
+    logger.info("🤖 Bot starting...")
+    await app.start()
+    
+    # Keep running
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
