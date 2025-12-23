@@ -1,186 +1,220 @@
 import os
-import time
 import asyncio
-import logging
-import re
 import math
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from pyrogram import Client, errors
 from aiohttp import web
-from pyrogram import Client, filters, enums
 
-# --- CONFIGURATION ---
-API_ID = int(os.environ.get("API_ID", "0")) 
-API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0")) 
+# --- CONFIGURATION (Environment Variables se values lega) ---
+# Koyeb par yeh variables set karne honge
+API_ID = int(os.environ.get("API_ID", "12345")) # Apna API ID yahan default mein na dalein, Env Var use karein
+API_HASH = os.environ.get("API_HASH", "your_api_hash")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token")
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "-100123456789")) # Bin Channel ID (Must start with -100)
 PORT = int(os.environ.get("PORT", "8080"))
+HOST_URL = os.environ.get("HOST_URL", "https://your-app-name.koyeb.app") # Deploy hone ke baad wala URL
 
-# Logging setup
-logging.basicConfig(level=logging.INFO)
+# Logging setup taki errors dikh sakein
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-# --- BOT CLIENT SETUP ---
-app = Client(
-    "my_bot",
+# --- PYROGRAM CLIENT SETUP (Streaming ke liye) ---
+# Pyrogram ka use hum sirf file stream karne aur channel se link lene ke liye karenge
+# Hum 'no_updates=True' use karenge taki yeh bot commands ke liye clash na kare
+pyro_client = Client(
+    "stream_bot_session",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+    bot_token=BOT_TOKEN,
+    no_updates=True 
 )
 
-# --- WEB SERVER ROUTES ---
-async def handle_stream(request):
-    try:
-        message_id = int(request.match_info['message_id'])
-        msg = await app.get_messages(CHANNEL_ID, message_id)
-        
-        if not msg or not msg.media:
-            return web.Response(text="File not found or deleted.", status=404)
+# --- HELPER FUNCTIONS ---
 
-        # File Details
-        file_name = "file"
-        file_size = 0
-        mime_type = "application/octet-stream"
+def get_readable_size(size):
+    # File size ko MB/GB mein convert karne ke liye
+    if size == 0:
+        return "0B"
+    units = ("B", "KB", "MB", "GB", "TB")
+    i = int(math.floor(math.log(size, 1024)))
+    p = math.pow(1024, i)
+    s = round(size / p, 2)
+    return f"{s} {units[i]}"
 
-        if msg.document:
-            file_name = msg.document.file_name
-            file_size = msg.document.file_size
-            mime_type = msg.document.mime_type
-        elif msg.video:
-            file_name = msg.video.file_name or "video.mp4"
-            file_size = msg.video.file_size
-            mime_type = msg.video.mime_type
-        elif msg.audio:
-            file_name = msg.audio.file_name or "audio.mp3"
-            file_size = msg.audio.file_size
-            mime_type = msg.audio.mime_type
-
-        # --- RANGE HANDLING (FIXED LOGIC) ---
-        range_header = request.headers.get("Range")
-        
-        from_bytes = 0
-        until_bytes = file_size - 1
-        status_code = 200
-        content_length = file_size
-
-        if range_header:
-            try:
-                ranges = re.findall(r"bytes=(\d+)-(\d*)", range_header)
-                if ranges:
-                    from_bytes = int(ranges[0][0])
-                    if ranges[0][1]:
-                        until_bytes = int(ranges[0][1])
-                    
-                    if from_bytes >= file_size:
-                         return web.Response(status=416, headers={'Content-Range': f'bytes */{file_size}'})
-
-                    content_length = until_bytes - from_bytes + 1
-                    status_code = 206
-            except Exception as e:
-                logger.error(f"Range Error: {e}")
-
-        # Headers
-        headers = {
-            'Content-Type': mime_type,
-            'Content-Disposition': f'inline; filename="{file_name}"',
-            'Accept-Ranges': 'bytes',
-            'Content-Length': str(content_length),
-        }
-
-        if status_code == 206:
-            headers['Content-Range'] = f'bytes {from_bytes}-{until_bytes}/{file_size}'
-
-        resp = web.StreamResponse(status=status_code, headers=headers)
-        await resp.prepare(request)
-
-        # --- IMPORTANT FIX HERE ---
-        # Pyrogram chunks are 1MB (1024 * 1024 bytes)
-        # We must calculate which CHUNK to start from, not which Byte.
-        CHUNK_SIZE = 1024 * 1024
-        
-        # Calculate start chunk index
-        start_chunk_index = from_bytes // CHUNK_SIZE
-        
-        # Calculate how many bytes to skip inside that first chunk
-        skip_in_first_chunk = from_bytes % CHUNK_SIZE
-        
-        # Start streaming from the correct chunk
-        # offset expects number of chunks, NOT bytes
-        async for chunk in app.stream_media(msg, offset=start_chunk_index):
-            
-            # Agar hume chunk ke beech mein se data chahiye (Skip logic)
-            if skip_in_first_chunk > 0:
-                if len(chunk) > skip_in_first_chunk:
-                    chunk = chunk[skip_in_first_chunk:]
-                    skip_in_first_chunk = 0 # Skip done
-                else:
-                    skip_in_first_chunk -= len(chunk)
-                    continue # Ye pura chunk skip karo
-            
-            # Agar user ne specific range maangi thi, to extra data mat bhejo
-            # (Optional: Browser khud connection close kar deta hai usually)
-            
-            try:
-                await resp.write(chunk)
-            except Exception:
-                break # Agar user ne video band kar di to loop roko
-            
-        return resp
-
-    except Exception as e:
-        logger.error(f"Stream Error: {e}")
-        return web.Response(text="Link Expired or Server Error", status=500)
-
-async def health_check(request):
-    return web.Response(text="Bot is running! 24/7 Service.")
-
-# --- BOT COMMANDS ---
-
-@app.on_message(filters.command("start") & filters.private)
-async def start(client, message):
-    await message.reply_text(
-        f"👋 Salam **{message.from_user.first_name}**!\n\n"
-        "Mujhe koi bhi File ya Video bhejo, main uska **Permanent Direct Link** bana dunga.\n"
-        "Ye link Lifetime kaam karega aur free hai.\n\n"
-        "✅ **Video Playback Fixed!**"
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /start command ka response
+    await update.message.reply_text(
+        "👋 **Salam! Main File Stream Bot hun.**\n\n"
+        "Mujhe koi bhi file ya video bhejo, main uska **Permanent Direct Link** bana dunga.\n"
+        "Link se aap video online play bhi kar sakte hain (Stream) aur download bhi!",
+        parse_mode="Markdown"
     )
 
-@app.on_message((filters.document | filters.video | filters.audio) & filters.private)
-async def file_handler(client, message):
-    status_msg = await message.reply_text("⏳ **Processing...**")
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Jab user file bhejta hai
+    msg = update.message
+    # Check karein file hai ya nahi
+    if not (msg.document or msg.video or msg.audio):
+        return
+
+    # User ko batayein ki process ho raha hai
+    status_msg = await msg.reply_text("🔄 **Processing...**\nFile channel pe upload ho rahi hai...")
 
     try:
-        log_msg = await message.copy(CHANNEL_ID)
-        msg_id = log_msg.id
+        # File ka naam aur ID nikalein
+        file_name = msg.document.file_name if msg.document else (msg.video.file_name if msg.video else "file")
+        file_size = msg.document.file_size if msg.document else (msg.video.file_size if msg.video else msg.audio.file_size)
         
-        base_url = os.environ.get("APP_URL", "http://localhost:8080")
-        stream_link = f"{base_url}/stream/{msg_id}"
+        # NOTE: File ko hum 'forward' kar rahe hain private channel mein.
+        # Yeh sabse fast method hai, file re-upload nahi hoti, bas forward hoti hai.
+        # forward_messages method python-telegram-bot ka use kar rahe hain.
+        forwarded_msg = await msg.forward(chat_id=CHANNEL_ID)
         
-        fname = message.video.file_name if message.video else message.document.file_name if message.document else "file"
+        # Message ID jo channel mein mila
+        msg_id = forwarded_msg.message_id
         
-        await status_msg.edit_text(
-            f"✅ **Link Generated!**\n\n🔗 {stream_link}",
-            disable_web_page_preview=True
+        # Links generate karein
+        # Link format: https://domain.com/stream/message_id
+        stream_link = f"{HOST_URL}/stream/{msg_id}"
+        download_link = f"{HOST_URL}/download/{msg_id}"
+
+        # User ko final message bhejein
+        text = (
+            "✅ **File Upload Complete!**\n\n"
+            f"📄 **File:** `{file_name}`\n"
+            f"📦 **Size:** `{get_readable_size(file_size)}`\n\n"
+            f"🎬 **Stream:** [Click Here]({stream_link})\n"
+            f"⬇️ **Download:** [Click Here]({download_link})\n\n"
+            "⏰ **Validity:** Lifetime ♾️"
         )
+        
+        keyboard = [[InlineKeyboardButton("🎬 Watch / Download", url=stream_link)]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await status_msg.edit_text(text, parse_mode="Markdown", reply_markup=reply_markup)
 
     except Exception as e:
         logger.error(f"Error: {e}")
-        await status_msg.edit_text(f"❌ Error: {str(e)}")
+        await status_msg.edit_text(f"❌ Error aaya: {str(e)}")
+
+# --- AIOHTTP SERVER HANDLERS (Streaming Logic) ---
+
+async def stream_handler(request):
+    # Yeh function browser requests handle karega
+    try:
+        # URL se message_id nikalo (e.g., /stream/123 -> 123)
+        message_id = int(request.match_info['message_id'])
+        
+        # Pyrogram se message fetch karein channel se
+        try:
+            message = await pyro_client.get_messages(CHANNEL_ID, message_id)
+            if message.empty:
+                return web.Response(status=404, text="File not found in channel.")
+            media = message.video or message.document or message.audio
+            if not media:
+                return web.Response(status=404, text="Not a media file.")
+        except Exception as e:
+            return web.Response(status=400, text=f"File fetch error: {e}")
+
+        # File properties
+        file_size = media.file_size
+        mime_type = media.mime_type or "application/octet-stream"
+        file_name = media.file_name or "video.mp4"
+
+        # Range Header Handle karna (Video seek/forward ke liye zaroori)
+        range_header = request.headers.get("Range")
+        
+        if range_header:
+            # Browser ne specific hissa manga hai (seeking)
+            from_bytes, until_bytes = range_header.replace("bytes=", "").split("-")
+            from_bytes = int(from_bytes)
+            until_bytes = int(until_bytes) if until_bytes else file_size - 1
+            
+            content_length = (until_bytes - from_bytes) + 1
+            
+            # Pyrogram ka 'stream_media' use karke specific chunk download/stream karein
+            # Offset = kahan se shuru karna hai
+            body = pyro_client.stream_media(message, offset=from_bytes, limit=content_length)
+            
+            return web.Response(
+                body=body,
+                status=206, # 206 means Partial Content (streaming works)
+                headers={
+                    "Content-Range": f"bytes {from_bytes}-{until_bytes}/{file_size}",
+                    "Content-Length": str(content_length),
+                    "Content-Type": mime_type,
+                    "Accept-Ranges": "bytes",
+                    "Content-Disposition": f'inline; filename="{file_name}"'
+                }
+            )
+        else:
+            # Agar full file maangi gayi hai (download)
+            body = pyro_client.stream_media(message)
+            return web.Response(
+                body=body,
+                status=200,
+                headers={
+                    "Content-Length": str(file_size),
+                    "Content-Type": mime_type,
+                    "Accept-Ranges": "bytes",
+                    "Content-Disposition": f'attachment; filename="{file_name}"'
+                }
+            )
+
+    except Exception as e:
+        logger.error(f"Stream Error: {e}")
+        return web.Response(status=500, text="Internal Server Error")
+
+async def health_check(request):
+    return web.Response(text="Bot is Alive!", status=200)
 
 # --- MAIN EXECUTION ---
-async def start_services():
-    web_app = web.Application()
-    web_app.router.add_get('/stream/{message_id}', handle_stream)
-    web_app.router.add_get('/', health_check)
 
-    runner = web.AppRunner(web_app)
+async def main():
+    # 1. Pyrogram Client Start karein
+    await pyro_client.start()
+    print("✅ Pyrogram Client Started (Backend)")
+
+    # 2. Python-Telegram-Bot Application Setup
+    ptb_app = Application.builder().token(BOT_TOKEN).build()
+    ptb_app.add_handler(CommandHandler("start", start))
+    ptb_app.add_handler(MessageHandler(filters.Document.ALL | filters.VIDEO | filters.AUDIO, handle_file))
+    
+    # PTB ko initialize aur start karein (Polling mode mein)
+    await ptb_app.initialize()
+    await ptb_app.start()
+    await ptb_app.updater.start_polling()
+    print("✅ Bot Started Polling (Frontend)")
+
+    # 3. Web Server Setup (aiohttp)
+    server_app = web.Application()
+    server_app.router.add_get("/", health_check) # Health check endpoint
+    server_app.router.add_get("/stream/{message_id}", stream_handler)
+    server_app.router.add_get("/download/{message_id}", stream_handler) # Download route bhi same logic use karega
+
+    runner = web.AppRunner(server_app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logger.info(f"🌍 Web Server running on Port {PORT}")
+    print(f"✅ Web Server Running on Port {PORT}")
 
-    logger.info("🤖 Bot starting...")
-    await app.start()
-    await asyncio.Event().wait()
+    # Process ko alive rakhne ke liye infinite loop
+    # Hum yahan 'Event' ka wait karenge taaki script band na ho
+    stop_event = asyncio.Event()
+    await stop_event.wait()
+
+    # Cleanup (Jab bot stop ho)
+    await ptb_app.updater.stop()
+    await ptb_app.stop()
+    await ptb_app.shutdown()
+    await pyro_client.stop()
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(start_services())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
