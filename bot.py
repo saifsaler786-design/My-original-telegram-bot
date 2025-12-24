@@ -18,19 +18,19 @@ PORT = int(os.environ.get("PORT", "8080"))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- BOT CLIENT SETUP (Optimized for Speed) ---
+# --- BOT CLIENT SETUP ---
 bot = Client(
     "FreeStreamBot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workers=100, # Workers badha diye
+    workers=100,
     sleep_threshold=10,
-    max_concurrent_transmissions=10 # Speed boost ke liye
+    max_concurrent_transmissions=10
 )
 
-# --- HTML PLAYER TEMPLATE ---
-# Yeh player buffering issue khatam kar dega
+# --- HTML PLAYER TEMPLATE (FIXED BRACKETS) ---
+# NOTE: CSS aur JS ke liye {{ }} use kiya hai taake Python error na de
 PLAYER_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -39,9 +39,9 @@ PLAYER_TEMPLATE = """
     <title>Watch Video</title>
     <link rel="stylesheet" href="https://cdn.plyr.io/3.7.8/plyr.css" />
     <style>
-        body { margin: 0; background: #0f0f0f; display: flex; justify-content: center; align-items: center; height: 100vh; color: white; font-family: sans-serif; }
-        .container { width: 95%; max-width: 800px; }
-        .btn { display: block; text-align: center; margin-top: 20px; padding: 10px; background: #2a2a2a; color: #fff; text-decoration: none; border-radius: 5px; }
+        body {{ margin: 0; background: #0f0f0f; display: flex; justify-content: center; align-items: center; height: 100vh; color: white; font-family: sans-serif; }}
+        .container {{ width: 95%; max-width: 800px; }}
+        .btn {{ display: block; text-align: center; margin-top: 20px; padding: 10px; background: #2a2a2a; color: #fff; text-decoration: none; border-radius: 5px; }}
     </style>
 </head>
 <body>
@@ -53,10 +53,10 @@ PLAYER_TEMPLATE = """
     </div>
     <script src="https://cdn.plyr.io/3.7.8/plyr.polyfilled.js"></script>
     <script>
-        const player = new Plyr('video', {
+        const player = new Plyr('video', {{
             controls: ['play-large', 'play', 'progress', 'current-time', 'mute', 'volume', 'fullscreen', 'settings'],
-            speed: { selected: 1, options: [0.5, 1, 1.5, 2] }
-        });
+            speed: {{ selected: 1, options: [0.5, 1, 1.5, 2] }}
+        }});
     </script>
 </body>
 </html>
@@ -104,7 +104,6 @@ async def stream_handler(request):
 
         length = until_bytes - from_bytes + 1
         
-        # Headers
         headers = {
             'Content-Type': mime_type,
             'Content-Range': f'bytes {from_bytes}-{until_bytes}/{file_size}',
@@ -116,14 +115,14 @@ async def stream_handler(request):
         resp = web.StreamResponse(status=206 if range_header else 200, headers=headers)
         await resp.prepare(request)
 
-        # FIX: Chunk Size bada kiya (1MB) taake loading kam ho
+        # 1MB Chunks
         chunk_size = 1024 * 1024 
         
         try:
             async for chunk in bot.stream_media(msg, offset=from_bytes, limit=length):
                 await resp.write(chunk)
         except Exception:
-            pass # Connection dropped by user, ignore error
+            pass 
             
         return resp
 
@@ -131,7 +130,7 @@ async def stream_handler(request):
         logger.error(f"Stream Error: {e}")
         return web.Response(status=500, text="Server Error")
 
-# --- WEB SERVER: PLAYER HANDLER (New Feature) ---
+# --- WEB SERVER: PLAYER HANDLER ---
 async def player_handler(request):
     try:
         message_id = int(request.match_info['message_id'])
@@ -141,8 +140,11 @@ async def player_handler(request):
         file_name = media.file_name if media.file_name else "video.mp4"
         mime_type = mimetypes.guess_type(file_name)[0] or "video/mp4"
         
-        # Dynamic URL construction
         base_url = str(request.url).split("/play/")[0]
+        # Ensure HTTP/HTTPS
+        if "localhost" not in base_url and not base_url.startswith("http"):
+             base_url = "https://" + base_url
+
         stream_url = f"{base_url}/watch/{message_id}"
         download_url = f"{base_url}/watch/{message_id}?download=true"
         
@@ -152,6 +154,7 @@ async def player_handler(request):
             content_type='text/html'
         )
     except Exception as e:
+        logger.error(e)
         return web.Response(text=f"Error: {e}")
 
 # --- BOT COMMANDS ---
@@ -165,12 +168,10 @@ async def file_handler(client, message):
     try:
         copied_msg = await message.copy(CHANNEL_ID)
         
-        # Koyeb Base URL Environment se lein
         base_url = os.environ.get("BASE_URL", "http://localhost:8080")
-        
-        # Links
+        if base_url.endswith("/"): base_url = base_url[:-1]
+
         play_link = f"{base_url}/play/{copied_msg.id}"
-        stream_link = f"{base_url}/watch/{copied_msg.id}"
         download_link = f"{base_url}/watch/{copied_msg.id}?download=true"
 
         media = message.video or message.document or message.audio
@@ -195,14 +196,14 @@ async def file_handler(client, message):
 async def start_services():
     app = web.Application()
     app.router.add_get('/watch/{message_id}', stream_handler)
-    app.router.add_get('/play/{message_id}', player_handler) # New Route
+    app.router.add_get('/play/{message_id}', player_handler) 
     
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     
-    print("Bot aur Player Service Started!")
+    print("Bot Started!")
     await bot.start()
     await asyncio.Event().wait()
 
