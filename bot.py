@@ -61,20 +61,40 @@ async def handle_stream(request):
             file_size = msg.audio.file_size
             mime_type = msg.audio.mime_type
             
-        # Headers set karo taake browser samajh sake ye file hai
+        # --- RANGE REQUEST LOGIC (Forward/Backward Support) ---
+        offset = 0
+        limit = file_size
+        range_header = request.headers.get("Range")
+        status_code = 200
+
         headers = {
             'Content-Type': mime_type,
             'Content-Disposition': f'inline; filename="{file_name}"',
-            'Content-Length': str(file_size)
+            'Accept-Ranges': 'bytes'
         }
 
+        if range_header:
+            try:
+                # Range header format: bytes=100-
+                from_bytes, until_bytes = range_header.replace('bytes=', '').split('-')
+                offset = int(from_bytes)
+                # Agar user ne specific end byte nahi diya to end tak play karo
+                limit = int(until_bytes) - offset + 1 if until_bytes else file_size - offset
+                
+                status_code = 206  # Partial Content
+                headers['Content-Range'] = f'bytes {offset}-{offset + limit - 1}/{file_size}'
+            except Exception:
+                pass # Agar range calculation fail ho to normal play karo
+        
+        headers['Content-Length'] = str(limit)
+
         # Response stream shuru karo
-        resp = web.StreamResponse(status=200, headers=headers)
+        resp = web.StreamResponse(status=status_code, headers=headers)
         await resp.prepare(request)
 
         # Telegram se download karke direct user ko stream karo (Chunk by Chunk)
-        # Yeh sabse important part hai free streaming ke liye
-        async for chunk in app.stream_media(msg):
+        # limit aur offset add kiya taake video beech se play ho sake
+        async for chunk in app.stream_media(msg, limit=limit, offset=offset):
             await resp.write(chunk)
             
         return resp
