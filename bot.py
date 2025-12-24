@@ -1,7 +1,8 @@
 import os
 import logging
 import asyncio
-import mimetypes # <--- Yeh naya add kiya hai fix ke liye
+import mimetypes
+import time
 from aiohttp import web
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -17,17 +18,51 @@ PORT = int(os.environ.get("PORT", "8080"))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- BOT CLIENT ---
+# --- BOT CLIENT SETUP (Optimized for Speed) ---
 bot = Client(
     "FreeStreamBot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workers=50,
-    sleep_threshold=10
+    workers=100, # Workers badha diye
+    sleep_threshold=10,
+    max_concurrent_transmissions=10 # Speed boost ke liye
 )
 
-# --- HELPER: Size Readable Banana ---
+# --- HTML PLAYER TEMPLATE ---
+# Yeh player buffering issue khatam kar dega
+PLAYER_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Watch Video</title>
+    <link rel="stylesheet" href="https://cdn.plyr.io/3.7.8/plyr.css" />
+    <style>
+        body { margin: 0; background: #0f0f0f; display: flex; justify-content: center; align-items: center; height: 100vh; color: white; font-family: sans-serif; }
+        .container { width: 95%; max-width: 800px; }
+        .btn { display: block; text-align: center; margin-top: 20px; padding: 10px; background: #2a2a2a; color: #fff; text-decoration: none; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <video controls crossorigin playsinline poster="">
+            <source src="{stream_url}" type="{mime_type}">
+        </video>
+        <a href="{download_url}" class="btn">⬇️ Download File</a>
+    </div>
+    <script src="https://cdn.plyr.io/3.7.8/plyr.polyfilled.js"></script>
+    <script>
+        const player = new Plyr('video', {
+            controls: ['play-large', 'play', 'progress', 'current-time', 'mute', 'volume', 'fullscreen', 'settings'],
+            speed: { selected: 1, options: [0.5, 1, 1.5, 2] }
+        });
+    </script>
+</body>
+</html>
+"""
+
+# --- HELPER: Size Readable ---
 def get_readable_size(size):
     if not size: return ""
     power = 2**10
@@ -38,30 +73,25 @@ def get_readable_size(size):
         n += 1
     return f"{size:.2f} {power_labels[n]}B"
 
-# --- WEB SERVER (FIXED STREAMING HANDLER) ---
+# --- WEB SERVER: STREAM HANDLER ---
 async def stream_handler(request):
     try:
         message_id = int(request.match_info['message_id'])
-        # Check download param
         is_download = request.query.get('download') is not None
         
         msg = await bot.get_messages(CHANNEL_ID, message_id)
         if not msg or not msg.media:
             return web.Response(status=404, text="404: File Not Found")
 
-        # Media Extract
         media = msg.video or msg.document or msg.audio
-        file_id = media.file_id
         file_size = media.file_size
         file_name = media.file_name if media.file_name else "video.mp4"
         
-        # --- FIX 1: MIME TYPE FORCE ---
-        # Telegram aksar galat mime_type deta hai, hum file name se guess karenge
+        # Mime Type Fix
         mime_type = mimetypes.guess_type(file_name)[0]
-        if not mime_type:
-            mime_type = "video/mp4" # Default fallback
+        if not mime_type: mime_type = "video/mp4"
 
-        # Range Header Parsing (Important for Seeking)
+        # Range Handling
         range_header = request.headers.get('Range', None)
         from_bytes, until_bytes = 0, file_size - 1
 
@@ -70,37 +100,30 @@ async def stream_handler(request):
                 from_bytes, until_bytes = range_header.replace('bytes=', '').split('-')
                 from_bytes = int(from_bytes)
                 until_bytes = int(until_bytes) if until_bytes else file_size - 1
-            except:
-                pass # Agar range galat hai to full file bhejo
+            except: pass
 
-        # Length calculation
         length = until_bytes - from_bytes + 1
         
-        # Headers Construction
-        disposition = 'attachment' if is_download else 'inline'
-        
+        # Headers
         headers = {
             'Content-Type': mime_type,
             'Content-Range': f'bytes {from_bytes}-{until_bytes}/{file_size}',
             'Content-Length': str(length),
-            'Content-Disposition': f'{disposition}; filename="{file_name}"',
+            'Content-Disposition': f'{"attachment" if is_download else "inline"}; filename="{file_name}"',
             'Accept-Ranges': 'bytes',
         }
 
-        # Status 206 means "Partial Content" (Video Player needs this)
-        status_code = 206 if range_header else 200
-
-        resp = web.StreamResponse(status=status_code, headers=headers)
+        resp = web.StreamResponse(status=206 if range_header else 200, headers=headers)
         await resp.prepare(request)
 
-        # --- FIX 2: CHUNK SIZE OPTIMIZATION ---
-        # 1MB chunks (1024*1024) better hain streaming ke liye
-        async for chunk in bot.stream_media(msg, offset=from_bytes, limit=length):
-            try:
+        # FIX: Chunk Size bada kiya (1MB) taake loading kam ho
+        chunk_size = 1024 * 1024 
+        
+        try:
+            async for chunk in bot.stream_media(msg, offset=from_bytes, limit=length):
                 await resp.write(chunk)
-            except Exception:
-                # Agar user video band kar de, to loop break kar do
-                break
+        except Exception:
+            pass # Connection dropped by user, ignore error
             
         return resp
 
@@ -108,21 +131,45 @@ async def stream_handler(request):
         logger.error(f"Stream Error: {e}")
         return web.Response(status=500, text="Server Error")
 
-# --- BOT HANDLERS ---
+# --- WEB SERVER: PLAYER HANDLER (New Feature) ---
+async def player_handler(request):
+    try:
+        message_id = int(request.match_info['message_id'])
+        msg = await bot.get_messages(CHANNEL_ID, message_id)
+        
+        media = msg.video or msg.document or msg.audio
+        file_name = media.file_name if media.file_name else "video.mp4"
+        mime_type = mimetypes.guess_type(file_name)[0] or "video/mp4"
+        
+        # Dynamic URL construction
+        base_url = str(request.url).split("/play/")[0]
+        stream_url = f"{base_url}/watch/{message_id}"
+        download_url = f"{base_url}/watch/{message_id}?download=true"
+        
+        # HTML Render
+        return web.Response(
+            text=PLAYER_TEMPLATE.format(stream_url=stream_url, mime_type=mime_type, download_url=download_url),
+            content_type='text/html'
+        )
+    except Exception as e:
+        return web.Response(text=f"Error: {e}")
+
+# --- BOT COMMANDS ---
 @bot.on_message(filters.command("start") & filters.private)
 async def start(client, message):
-    await message.reply_text("👋 **Bot Ready!**\nFile bhejo, main Stream link dunga.")
+    await message.reply_text("👋 **Bot Ready!**\nFile bhejo, main Player Link dunga.")
 
 @bot.on_message((filters.document | filters.video | filters.audio) & filters.private)
 async def file_handler(client, message):
-    # Process message
     status_msg = await message.reply_text("🔄 **Processing...**")
-    
     try:
         copied_msg = await message.copy(CHANNEL_ID)
         
+        # Koyeb Base URL Environment se lein
         base_url = os.environ.get("BASE_URL", "http://localhost:8080")
         
+        # Links
+        play_link = f"{base_url}/play/{copied_msg.id}"
         stream_link = f"{base_url}/watch/{copied_msg.id}"
         download_link = f"{base_url}/watch/{copied_msg.id}?download=true"
 
@@ -134,14 +181,13 @@ async def file_handler(client, message):
             f"✅ **File Ready!**\n\n"
             f"📄 **Name:** `{file_name}`\n"
             f"📦 **Size:** `{file_size}`\n\n"
-            f"🎬 **Stream Link:**\n{stream_link}\n\n"
-            f"⬇️ **Download Link:**\n{download_link}",
+            f"▶️ **Play Online:**\n{play_link}\n\n"
+            f"⬇️ **Direct Download:**\n{download_link}",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🎬 Watch Online", url=stream_link)],
-                [InlineKeyboardButton("⬇️ Fast Download", url=download_link)]
+                [InlineKeyboardButton("▶️ Play Video", url=play_link)],
+                [InlineKeyboardButton("⬇️ Download", url=download_link)]
             ])
         )
-
     except Exception as e:
         await status_msg.edit_text(f"❌ Error: {e}")
 
@@ -149,12 +195,14 @@ async def file_handler(client, message):
 async def start_services():
     app = web.Application()
     app.router.add_get('/watch/{message_id}', stream_handler)
+    app.router.add_get('/play/{message_id}', player_handler) # New Route
+    
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     
-    print("Bot Started")
+    print("Bot aur Player Service Started!")
     await bot.start()
     await asyncio.Event().wait()
 
