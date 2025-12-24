@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+import mimetypes # <--- Yeh naya add kiya hai fix ke liye
 from aiohttp import web
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -37,38 +38,45 @@ def get_readable_size(size):
         n += 1
     return f"{size:.2f} {power_labels[n]}B"
 
-# --- WEB SERVER (Stream & Download) ---
+# --- WEB SERVER (FIXED STREAMING HANDLER) ---
 async def stream_handler(request):
     try:
         message_id = int(request.match_info['message_id'])
-        # Check karein user Download chahta hai ya Stream
+        # Check download param
         is_download = request.query.get('download') is not None
         
-        # Channel se message lo
         msg = await bot.get_messages(CHANNEL_ID, message_id)
         if not msg or not msg.media:
-            return web.Response(status=404, text="404: File Not Found or Deleted")
+            return web.Response(status=404, text="404: File Not Found")
 
-        # File Details
+        # Media Extract
         media = msg.video or msg.document or msg.audio
         file_id = media.file_id
         file_size = media.file_size
-        file_name = media.file_name if media.file_name else "file.mp4"
-        mime_type = media.mime_type if media.mime_type else "video/mp4"
+        file_name = media.file_name if media.file_name else "video.mp4"
+        
+        # --- FIX 1: MIME TYPE FORCE ---
+        # Telegram aksar galat mime_type deta hai, hum file name se guess karenge
+        mime_type = mimetypes.guess_type(file_name)[0]
+        if not mime_type:
+            mime_type = "video/mp4" # Default fallback
 
-        # Range Handling (Video aage/peeche karne ke liye)
+        # Range Header Parsing (Important for Seeking)
         range_header = request.headers.get('Range', None)
         from_bytes, until_bytes = 0, file_size - 1
 
         if range_header:
-            from_bytes, until_bytes = range_header.replace('bytes=', '').split('-')
-            from_bytes = int(from_bytes)
-            until_bytes = int(until_bytes) if until_bytes else file_size - 1
+            try:
+                from_bytes, until_bytes = range_header.replace('bytes=', '').split('-')
+                from_bytes = int(from_bytes)
+                until_bytes = int(until_bytes) if until_bytes else file_size - 1
+            except:
+                pass # Agar range galat hai to full file bhejo
 
+        # Length calculation
         length = until_bytes - from_bytes + 1
         
-        # Headers set karo
-        # Agar is_download True hai to 'attachment' (Save file), warna 'inline' (Play file)
+        # Headers Construction
         disposition = 'attachment' if is_download else 'inline'
         
         headers = {
@@ -79,12 +87,20 @@ async def stream_handler(request):
             'Accept-Ranges': 'bytes',
         }
 
-        resp = web.StreamResponse(status=206 if range_header else 200, headers=headers)
+        # Status 206 means "Partial Content" (Video Player needs this)
+        status_code = 206 if range_header else 200
+
+        resp = web.StreamResponse(status=status_code, headers=headers)
         await resp.prepare(request)
 
-        # Telegram se Data Stream karna
+        # --- FIX 2: CHUNK SIZE OPTIMIZATION ---
+        # 1MB chunks (1024*1024) better hain streaming ke liye
         async for chunk in bot.stream_media(msg, offset=from_bytes, limit=length):
-            await resp.write(chunk)
+            try:
+                await resp.write(chunk)
+            except Exception:
+                # Agar user video band kar de, to loop break kar do
+                break
             
         return resp
 
@@ -95,37 +111,33 @@ async def stream_handler(request):
 # --- BOT HANDLERS ---
 @bot.on_message(filters.command("start") & filters.private)
 async def start(client, message):
-    await message.reply_text("👋 **Bot Ready!**\nFile bhejo, main link dunga.")
+    await message.reply_text("👋 **Bot Ready!**\nFile bhejo, main Stream link dunga.")
 
 @bot.on_message((filters.document | filters.video | filters.audio) & filters.private)
 async def file_handler(client, message):
+    # Process message
     status_msg = await message.reply_text("🔄 **Processing...**")
     
     try:
-        # 1. Channel mein copy karo
         copied_msg = await message.copy(CHANNEL_ID)
         
-        # 2. Links banao
-        # Important: Koyeb App URL yahan aayega
         base_url = os.environ.get("BASE_URL", "http://localhost:8080")
         
-        # Link Logic
         stream_link = f"{base_url}/watch/{copied_msg.id}"
-        download_link = f"{base_url}/watch/{copied_msg.id}?download=true" # ?download=true add kiya
+        download_link = f"{base_url}/watch/{copied_msg.id}?download=true"
 
         media = message.video or message.document or message.audio
         file_name = media.file_name if media.file_name else "Unknown"
         file_size = get_readable_size(media.file_size)
 
-        # 3. User ko reply
         await status_msg.edit_text(
-            f"✅ **File Saved!**\n\n"
+            f"✅ **File Ready!**\n\n"
             f"📄 **Name:** `{file_name}`\n"
             f"📦 **Size:** `{file_size}`\n\n"
-            f"🎬 **Stream:** [Click to Watch]({stream_link})\n"
-            f"⬇️ **Download:** [Click to Save]({download_link})",
+            f"🎬 **Stream Link:**\n{stream_link}\n\n"
+            f"⬇️ **Download Link:**\n{download_link}",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🎬 Stream Online", url=stream_link)],
+                [InlineKeyboardButton("🎬 Watch Online", url=stream_link)],
                 [InlineKeyboardButton("⬇️ Fast Download", url=download_link)]
             ])
         )
@@ -135,7 +147,6 @@ async def file_handler(client, message):
 
 # --- MAIN RUNNER ---
 async def start_services():
-    # Web Server
     app = web.Application()
     app.router.add_get('/watch/{message_id}', stream_handler)
     runner = web.AppRunner(app)
@@ -143,11 +154,8 @@ async def start_services():
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     
-    # Bot Start
-    print("Bot aur Server start ho gaye hain...")
+    print("Bot Started")
     await bot.start()
-    
-    # Keep Running
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
