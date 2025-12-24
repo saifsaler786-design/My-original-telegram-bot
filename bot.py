@@ -23,7 +23,28 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-# --- WEB SERVER ROUTES ---
+# --- HELPER: Get file info ---
+def get_file_info(msg):
+    file_name = "file"
+    file_size = 0
+    mime_type = "application/octet-stream"
+
+    if msg.document:
+        file_name = msg.document.file_name
+        file_size = msg.document.file_size
+        mime_type = msg.document.mime_type
+    elif msg.video:
+        file_name = msg.video.file_name or "video.mp4"
+        file_size = msg.video.file_size
+        mime_type = msg.video.mime_type
+    elif msg.audio:
+        file_name = msg.audio.file_name or "audio.mp3"
+        file_size = msg.audio.file_size
+        mime_type = msg.audio.mime_type
+    
+    return file_name, file_size, mime_type
+
+# --- STREAM ROUTE (Video play hogi browser mein) ---
 async def handle_stream(request):
     try:
         message_id = int(request.match_info['message_id'])
@@ -32,76 +53,84 @@ async def handle_stream(request):
         if not msg or not msg.media:
             return web.Response(text="File not found or deleted.", status=404)
 
-        file_name = "file"
-        file_size = 0
-        mime_type = "application/octet-stream"
+        file_name, file_size, mime_type = get_file_info(msg)
 
-        if msg.document:
-            file_name = msg.document.file_name
-            file_size = msg.document.file_size
-            mime_type = msg.document.mime_type
-        elif msg.video:
-            file_name = msg.video.file_name or "video.mp4"
-            file_size = msg.video.file_size
-            mime_type = msg.video.mime_type
-        elif msg.audio:
-            file_name = msg.audio.file_name or "audio.mp3"
-            file_size = msg.audio.file_size
-            mime_type = msg.audio.mime_type
-
-        # Range header check for seeking
+        # Range header check for seek support
         range_header = request.headers.get('Range')
         start = 0
         end = file_size - 1
-        
+
         if range_header:
-            # Parse range header (e.g., "bytes=1000-2000")
             range_str = range_header.replace('bytes=', '')
             parts = range_str.split('-')
             start = int(parts[0]) if parts[0] else 0
             end = int(parts[1]) if parts[1] else file_size - 1
 
         content_length = end - start + 1
-        
+
         headers = {
             'Content-Type': mime_type,
-            'Content-Disposition': f'inline; filename="{file_name}"',
+            'Content-Disposition': f'inline; filename="{file_name}"',  # INLINE = Play in browser
             'Content-Length': str(content_length),
             'Accept-Ranges': 'bytes',
             'Content-Range': f'bytes {start}-{end}/{file_size}'
         }
 
-        # 206 for partial content, 200 for full
-        status_code = 206 if range_header else 200
-
-        resp = web.StreamResponse(status=status_code, headers=headers)
+        status = 206 if range_header else 200
+        resp = web.StreamResponse(status=status, headers=headers)
         await resp.prepare(request)
 
-        # Stream with offset for seeking
         current_pos = 0
         async for chunk in app.stream_media(msg):
-            chunk_end = current_pos + len(chunk)
-            
-            if chunk_end <= start:
-                # Skip chunks before start position
-                current_pos = chunk_end
+            chunk_start = current_pos
+            chunk_end = current_pos + len(chunk) - 1
+
+            if chunk_end < start:
+                current_pos += len(chunk)
                 continue
-            
-            if current_pos >= end + 1:
-                # Stop if we've passed the end
+
+            if chunk_start > end:
                 break
-            
-            # Calculate which part of chunk to send
-            chunk_start = max(0, start - current_pos)
-            chunk_stop = min(len(chunk), end + 1 - current_pos)
-            
-            await resp.write(chunk[chunk_start:chunk_stop])
-            current_pos = chunk_end
+
+            write_start = max(0, start - chunk_start)
+            write_end = min(len(chunk), end - chunk_start + 1)
+            await resp.write(chunk[write_start:write_end])
+
+            current_pos += len(chunk)
             
         return resp
 
     except Exception as e:
         logger.error(f"Stream Error: {e}")
+        return web.Response(text="Link Expired or Server Error", status=500)
+
+# --- DOWNLOAD ROUTE (File download hogi) ---
+async def handle_download(request):
+    try:
+        message_id = int(request.match_info['message_id'])
+        msg = await app.get_messages(CHANNEL_ID, message_id)
+        
+        if not msg or not msg.media:
+            return web.Response(text="File not found or deleted.", status=404)
+
+        file_name, file_size, mime_type = get_file_info(msg)
+
+        headers = {
+            'Content-Type': mime_type,
+            'Content-Disposition': f'attachment; filename="{file_name}"',  # ATTACHMENT = Force download
+            'Content-Length': str(file_size)
+        }
+
+        resp = web.StreamResponse(status=200, headers=headers)
+        await resp.prepare(request)
+
+        async for chunk in app.stream_media(msg):
+            await resp.write(chunk)
+            
+        return resp
+
+    except Exception as e:
+        logger.error(f"Download Error: {e}")
         return web.Response(text="Link Expired or Server Error", status=500)
 
 async def health_check(request):
@@ -115,7 +144,8 @@ async def start(client, message):
         f"👋 Salam **{message.from_user.first_name}**!\n\n"
         "Mujhe koi bhi File ya Video bhejo, main uska **Permanent Direct Link** bana dunga.\n"
         "Ye link Lifetime kaam karega aur free hai.\n\n"
-        "🎯 **Features:** Video Seeking Support (Aga/Picha)\n"
+        "🎬 **Stream:** Video browser mein play hogi (seekable)\n"
+        "⬇️ **Download:** File seedha download hogi\n\n"
         "🚀 **Powered by:** Koyeb & Pyrogram"
     )
 
@@ -128,7 +158,9 @@ async def file_handler(client, message):
         msg_id = log_msg.id
         
         base_url = os.environ.get("APP_URL", "http://localhost:8080")
+        
         stream_link = f"{base_url}/stream/{msg_id}"
+        download_link = f"{base_url}/download/{msg_id}"  # Alag download link
         
         file_size_mb = 0
         if message.document:
@@ -146,9 +178,8 @@ async def file_handler(client, message):
             f"📄 **File:** `{fname}`\n"
             f"📦 **Size:** `{file_size_mb} MB`\n\n"
             f"🎬 **Stream Link:**\n{stream_link}\n\n"
-            f"⬇️ **Download Link:**\n{stream_link}\n\n"
+            f"⬇️ **Download Link:**\n{download_link}\n\n"
             "⏰ **Validity:** Lifetime ♾️\n"
-            "🎯 **Seeking:** Supported ✅\n"
             "⚠️ *Note: Link tab tak chalega jab tak bot ON hai.*"
         )
         
@@ -162,6 +193,7 @@ async def file_handler(client, message):
 async def start_services():
     web_app = web.Application()
     web_app.router.add_get('/stream/{message_id}', handle_stream)
+    web_app.router.add_get('/download/{message_id}', handle_download)  # Download route add kiya
     web_app.router.add_get('/', health_check)
 
     runner = web.AppRunner(web_app)
