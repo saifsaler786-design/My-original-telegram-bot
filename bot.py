@@ -1,149 +1,173 @@
 import os
-import logging
+import time
 import asyncio
+import logging
 from aiohttp import web
-from pyrogram import Client
-from pyrogram.types import Message as PyroMessage
-from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
+from pyrogram import Client, filters, enums
 
-# --- CONFIGURATION ---
-API_ID = int(os.environ.get("API_ID"))
-API_HASH = os.environ.get("API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-BIN_CHANNEL = int(os.environ.get("BIN_CHANNEL"))
-# Koyeb default port 8000 use karta hai, isay fix kar diya hai
-PORT = int(os.environ.get("PORT", 8000)) 
-BASE_URL = os.environ.get("BASE_URL")
+# --- CONFIGURATION (Environment Variables se values lega) ---
+# Koyeb par yeh variables set karne honge
+API_ID = int(os.environ.get("API_ID", "0")) 
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0")) # Private Channel ID (e.g., -100xxxx)
 
-# --- LOGGING ---
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# Server Port (Koyeb auto-assign karta hai, default 8080)
+PORT = int(os.environ.get("PORT", "8080"))
+
+# Logging setup (Errors dekhne ke liye)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- PYROGRAM CLIENT ---
-# Ye background mein chalega files stream karne ke liye
-pyro_client = Client(
-    "stream_bot_session",
+# --- BOT CLIENT SETUP ---
+app = Client(
+    "my_bot",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    no_updates=True
+    bot_token=BOT_TOKEN
 )
 
-# --- WEB SERVER HANDLERS ---
-
-async def health_check(request):
-    """Koyeb ko batane ke liye ke bot zinda hai"""
-    return web.Response(text="Bot is Running!", status=200)
-
-async def stream_handler(request):
-    """File streaming logic"""
+# --- WEB SERVER ROUTES ---
+async def handle_stream(request):
+    """
+    Yeh function tab chalega jab koi link open karega.
+    Yeh Telegram se file stream karke user ke browser mein bhejta hai.
+    """
     try:
+        # URL se message id nikalo (e.g., /stream/123 -> 123)
         message_id = int(request.match_info['message_id'])
-        msg: PyroMessage = await pyro_client.get_messages(BIN_CHANNEL, message_id)
         
-        if not msg or (not msg.video and not msg.document):
-            return web.Response(status=404, text="File Not Found")
-
-        file_size = msg.video.file_size if msg.video else msg.document.file_size
-        file_name = msg.video.file_name if msg.video else (msg.document.file_name or "video.mp4")
+        # Channel se message fetch karo
+        msg = await app.get_messages(CHANNEL_ID, message_id)
         
-        # Range handling for streaming (seek support)
-        range_header = request.headers.get('Range')
-        offset = 0
-        length = file_size
+        if not msg or not msg.media:
+            return web.Response(text="File not found or deleted.", status=404)
 
-        if range_header:
-            parts = range_header.replace('bytes=', '').split('-')
-            offset = int(parts[0])
-            if parts[1]:
-                length = int(parts[1]) - offset + 1
-            else:
-                length = file_size - offset
+        # File ki details nikalo
+        file_name = "file"
+        file_size = 0
+        mime_type = "application/octet-stream"
 
+        if msg.document:
+            file_name = msg.document.file_name
+            file_size = msg.document.file_size
+            mime_type = msg.document.mime_type
+        elif msg.video:
+            file_name = msg.video.file_name or "video.mp4"
+            file_size = msg.video.file_size
+            mime_type = msg.video.mime_type
+        elif msg.audio:
+            file_name = msg.audio.file_name or "audio.mp3"
+            file_size = msg.audio.file_size
+            mime_type = msg.audio.mime_type
+            
+        # Headers set karo taake browser samajh sake ye file hai
         headers = {
-            'Content-Type': msg.video.mime_type if msg.video else msg.document.mime_type,
-            'Content-Range': f'bytes {offset}-{offset + length - 1}/{file_size}',
-            'Accept-Ranges': 'bytes',
-            'Content-Length': str(length),
-            'Content-Disposition': f'inline; filename="{file_name}"'
+            'Content-Type': mime_type,
+            'Content-Disposition': f'inline; filename="{file_name}"',
+            'Content-Length': str(file_size)
         }
 
-        response = web.StreamResponse(status=206 if range_header else 200, headers=headers)
-        await response.prepare(request)
+        # Response stream shuru karo
+        resp = web.StreamResponse(status=200, headers=headers)
+        await resp.prepare(request)
 
-        async for chunk in pyro_client.stream_media(msg, offset=offset, limit=length):
-            await response.write(chunk)
-
-        return response
+        # Telegram se download karke direct user ko stream karo (Chunk by Chunk)
+        # Yeh sabse important part hai free streaming ke liye
+        async for chunk in app.stream_media(msg):
+            await resp.write(chunk)
+            
+        return resp
 
     except Exception as e:
         logger.error(f"Stream Error: {e}")
-        return web.Response(status=500, text="Server Error")
+        return web.Response(text="Link Expired or Server Error", status=500)
 
-# --- TELEGRAM BOT HANDLERS ---
+async def health_check(request):
+    return web.Response(text="Bot is running! 24/7 Service.")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 **Bot Online Hai!**\nFile bhejein aur link hasil karein.")
+# --- BOT COMMANDS ---
 
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    status = await msg.reply_text("🔄 **Processing...**")
-    
+@app.on_message(filters.command("start") & filters.private)
+async def start(client, message):
+    await message.reply_text(
+        f"👋 Salam **{message.from_user.first_name}**!\n\n"
+        "Mujhe koi bhi File ya Video bhejo, main uska **Permanent Direct Link** bana dunga.\n"
+        "Ye link Lifetime kaam karega aur free hai.\n\n"
+        "🚀 **Powered by:** Koyeb & Pyrogram"
+    )
+
+@app.on_message((filters.document | filters.video | filters.audio) & filters.private)
+async def file_handler(client, message):
+    """
+    Jab user file bhejta hai:
+    1. File ko Database Channel mein copy karo.
+    2. Wahan se Message ID lo.
+    3. Link generate karo.
+    """
+    status_msg = await message.reply_text("⏳ **Processing...**\nFile channel pe upload ho rahi hai...")
+
     try:
-        # File ko channel mein bhejna
-        fwd = await msg.copy(chat_id=BIN_CHANNEL)
-        msg_id = fwd.message_id
+        # File ko private channel mein copy karo (Forward nahi, Copy taake user ID hide rahe)
+        log_msg = await message.copy(CHANNEL_ID)
+        msg_id = log_msg.id
         
-        file_name = msg.video.file_name if msg.video else (msg.document.file_name or "file")
+        # Server ka URL (Koyeb automatically URL assign karta hai, hum environment se bhi le sakte hain)
+        # Local testing ke liye localhost, Production ke liye Koyeb URL
+        # NOTE: Koyeb deploy hone ke baad jo URL milega wo yahan hardcode karna behtar hai
+        # Filhal hum dynamic host use karne ki koshish karte hain, lekin best hai ke APP_URL env var set karein
+        base_url = os.environ.get("APP_URL", "http://localhost:8080")
         
-        stream_link = f"{BASE_URL}/stream/{msg_id}"
-        download_link = f"{BASE_URL}/stream/{msg_id}"
+        stream_link = f"{base_url}/stream/{msg_id}"
         
-        await status.edit_text(
-            f"✅ **File Saved!**\n\n"
-            f"📄 **Name:** `{file_name}`\n"
-            f"🎬 **Stream:** {stream_link}\n"
-            f"⬇️ **Download:** {download_link}",
-            parse_mode="Markdown"
+        # File size formatting
+        file_size_mb = 0
+        if message.document:
+            file_size_mb = round(message.document.file_size / (1024 * 1024), 2)
+            fname = message.document.file_name
+        elif message.video:
+            file_size_mb = round(message.video.file_size / (1024 * 1024), 2)
+            fname = message.video.file_name or "video.mp4"
+        elif message.audio:
+            file_size_mb = round(message.audio.file_size / (1024 * 1024), 2)
+            fname = message.audio.file_name or "audio.mp3"
+            
+        response_text = (
+            "✅ **File Upload Complete!**\n\n"
+            f"📄 **File:** `{fname}`\n"
+            f"📦 **Size:** `{file_size_mb} MB`\n\n"
+            f"🎬 **Stream Link:**\n{stream_link}\n\n"
+            f"⬇️ **Download Link:**\n{stream_link}\n\n"
+            "⏰ **Validity:** Lifetime ♾️\n"
+            "⚠️ *Note: Link tab tak chalega jab tak bot ON hai.*"
         )
+        
+        await status_msg.edit_text(response_text, disable_web_page_preview=True)
+
     except Exception as e:
-        logger.error(e)
-        await status.edit_text("❌ Error uploading file.")
+        logger.error(f"Error: {e}")
+        await status_msg.edit_text(f"❌ Error aaya: {str(e)}")
 
 # --- MAIN EXECUTION ---
+async def start_services():
+    # Web App Setup
+    web_app = web.Application()
+    web_app.router.add_get('/stream/{message_id}', handle_stream)
+    web_app.router.add_get('/', health_check)
 
-async def main():
-    # 1. Start Pyrogram
-    await pyro_client.start()
-    
-    # 2. Start Web Server
-    app = web.Application()
-    app.router.add_get('/', health_check)  # Root path for Health Check
-    app.router.add_get('/stream/{message_id}', stream_handler)
-    
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(web_app)
     await runner.setup()
-    # Koyeb requires listening on 0.0.0.0 and PORT 8000
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    logger.info(f"Web Server running on port {PORT}")
+    logger.info(f"🌍 Web Server running on Port {PORT}")
 
-    # 3. Start Bot (PTB)
-    ptb = ApplicationBuilder().token(BOT_TOKEN).build()
-    ptb.add_handler(CommandHandler("start", start))
-    ptb.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, handle_file))
-    
-    await ptb.initialize()
-    await ptb.start()
-    await ptb.updater.start_polling()
+    # Bot Start
+    logger.info("🤖 Bot starting...")
+    await app.start()
     
     # Keep running
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    loop.run_until_complete(start_services())
