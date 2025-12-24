@@ -1,199 +1,214 @@
-from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from aiohttp import web
+import os
+import time
 import asyncio
+import logging
+from aiohttp import web
+from pyrogram import Client, filters, enums
 
-API_ID = "29579893"
-API_HASH = "a534ef5a149a4e8a5e6c7366b8f718a3"
-BOT_TOKEN = "8145896177:AAHb1ki8gsUBJzuzK0dAexdJ3WDHC3sLvWc"
-CHANNEL_ID = -1002653856134
+# --- CONFIGURATION (Environment Variables se values lega) ---
+API_ID = int(os.environ.get("API_ID", "0")) 
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))
 
-app = Client("stream_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-web_app = web.Application()
+PORT = int(os.environ.get("PORT", "8080"))
 
-# MIME types - MKV served as MP4 for browser compatibility
-MIME_TYPES = {
-    ".mp4": "video/mp4",
-    ".mkv": "video/mp4",
-    ".webm": "video/webm",
-    ".avi": "video/mp4",
-    ".mov": "video/mp4",
-    ".m4v": "video/mp4",
-    ".flv": "video/mp4",
-    ".wmv": "video/mp4",
-}
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def get_mime_type(file_name):
-    if file_name:
-        ext = "." + file_name.lower().split(".")[-1] if "." in file_name else ""
-        return MIME_TYPES.get(ext, "video/mp4")
-    return "video/mp4"
+app = Client(
+    "my_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
 
-async def handle_stream(request):
-    message_id = int(request.match_info['id'])
+# --- HELPER: Get file info ---
+def get_file_info(msg):
+    file_name = "file"
+    file_size = 0
+    mime_type = "application/octet-stream"
+
+    if msg.document:
+        file_name = msg.document.file_name
+        file_size = msg.document.file_size
+        mime_type = msg.document.mime_type
+    elif msg.video:
+        file_name = msg.video.file_name or "video.mp4"
+        file_size = msg.video.file_size
+        mime_type = msg.video.mime_type
+    elif msg.audio:
+        file_name = msg.audio.file_name or "audio.mp3"
+        file_size = msg.audio.file_size
+        mime_type = msg.audio.mime_type
     
+    return file_name, file_size, mime_type
+
+# --- STREAM ROUTE (Video play hogi browser mein) ---
+async def handle_stream(request):
     try:
-        message = await app.get_messages(CHANNEL_ID, message_id)
+        message_id = int(request.match_info['message_id'])
+        msg = await app.get_messages(CHANNEL_ID, message_id)
         
-        if not message.video and not message.document:
-            return web.Response(text="No video found", status=404)
-        
-        media = message.video or message.document
-        file_size = media.file_size
-        file_name = getattr(media, 'file_name', None) or f"video_{message_id}.mp4"
-        mime_type = get_mime_type(file_name)
-        
+        if not msg or not msg.media:
+            return web.Response(text="File not found or deleted.", status=404)
+
+        file_name, file_size, mime_type = get_file_info(msg)
+
+        # Range header check for seek support
         range_header = request.headers.get('Range')
-        
+        start = 0
+        end = file_size - 1
+
         if range_header:
             range_str = range_header.replace('bytes=', '')
-            start, end = range_str.split('-')
-            start = int(start)
-            end = int(end) if end else file_size - 1
-        else:
-            start = 0
-            end = file_size - 1
-        
+            parts = range_str.split('-')
+            start = int(parts[0]) if parts[0] else 0
+            end = int(parts[1]) if parts[1] else file_size - 1
+
         content_length = end - start + 1
-        
+
         headers = {
             'Content-Type': mime_type,
+            'Content-Disposition': f'inline; filename="{file_name}"',  # INLINE = Play in browser
             'Content-Length': str(content_length),
             'Accept-Ranges': 'bytes',
-            'Content-Disposition': f'inline; filename="{file_name}"',
-            'Cache-Control': 'no-cache',
+            'Content-Range': f'bytes {start}-{end}/{file_size}'
         }
-        
-        if range_header:
-            headers['Content-Range'] = f'bytes {start}-{end}/{file_size}'
-            status = 206
-        else:
-            status = 200
-        
-        response = web.StreamResponse(status=status, headers=headers)
-        await response.prepare(request)
-        
+
+        status = 206 if range_header else 200
+        resp = web.StreamResponse(status=status, headers=headers)
+        await resp.prepare(request)
+
         current_pos = 0
-        bytes_sent = 0
-        bytes_to_send = content_length
-        
-        async for chunk in app.stream_media(message):
-            chunk_size = len(chunk)
-            chunk_end = current_pos + chunk_size
-            
-            if chunk_end <= start:
-                current_pos = chunk_end
+        async for chunk in app.stream_media(msg):
+            chunk_start = current_pos
+            chunk_end = current_pos + len(chunk) - 1
+
+            if chunk_end < start:
+                current_pos += len(chunk)
                 continue
-            
-            if current_pos >= end + 1:
-                break
-            
-            if current_pos < start:
-                skip = start - current_pos
-                chunk = chunk[skip:]
-                current_pos = start
-            
-            if bytes_sent + len(chunk) > bytes_to_send:
-                chunk = chunk[:bytes_to_send - bytes_sent]
-            
-            if chunk:
-                await response.write(chunk)
-                bytes_sent += len(chunk)
-            
-            current_pos = chunk_end
-            
-            if bytes_sent >= bytes_to_send:
-                break
-        
-        await response.write_eof()
-        return response
-        
-    except Exception as e:
-        print(f"Stream error: {e}")
-        return web.Response(text=f"Error: {str(e)}", status=500)
 
+            if chunk_start > end:
+                break
+
+            write_start = max(0, start - chunk_start)
+            write_end = min(len(chunk), end - chunk_start + 1)
+            await resp.write(chunk[write_start:write_end])
+
+            current_pos += len(chunk)
+            
+        return resp
+
+    except Exception as e:
+        logger.error(f"Stream Error: {e}")
+        return web.Response(text="Link Expired or Server Error", status=500)
+
+# --- DOWNLOAD ROUTE (File download hogi) ---
 async def handle_download(request):
-    message_id = int(request.match_info['id'])
-    
     try:
-        message = await app.get_messages(CHANNEL_ID, message_id)
+        message_id = int(request.match_info['message_id'])
+        msg = await app.get_messages(CHANNEL_ID, message_id)
         
-        if not message.video and not message.document:
-            return web.Response(text="No video found", status=404)
-        
-        media = message.video or message.document
-        file_size = media.file_size
-        file_name = getattr(media, 'file_name', None) or f"video_{message_id}.mp4"
-        
+        if not msg or not msg.media:
+            return web.Response(text="File not found or deleted.", status=404)
+
+        file_name, file_size, mime_type = get_file_info(msg)
+
         headers = {
-            'Content-Type': 'application/octet-stream',
-            'Content-Length': str(file_size),
-            'Content-Disposition': f'attachment; filename="{file_name}"',
+            'Content-Type': mime_type,
+            'Content-Disposition': f'attachment; filename="{file_name}"',  # ATTACHMENT = Force download
+            'Content-Length': str(file_size)
         }
-        
-        response = web.StreamResponse(status=200, headers=headers)
-        await response.prepare(request)
-        
-        async for chunk in app.stream_media(message):
-            await response.write(chunk)
-        
-        await response.write_eof()
-        return response
-        
+
+        resp = web.StreamResponse(status=200, headers=headers)
+        await resp.prepare(request)
+
+        async for chunk in app.stream_media(msg):
+            await resp.write(chunk)
+            
+        return resp
+
     except Exception as e:
-        print(f"Download error: {e}")
-        return web.Response(text=f"Error: {str(e)}", status=500)
+        logger.error(f"Download Error: {e}")
+        return web.Response(text="Link Expired or Server Error", status=500)
 
-web_app.router.add_get('/stream/{id}', handle_stream)
-web_app.router.add_get('/download/{id}', handle_download)
+async def health_check(request):
+    return web.Response(text="Bot is running! 24/7 Service.")
 
-@app.on_message(filters.command("start"))
-async def start(client: Client, message: Message):
+# --- BOT COMMANDS ---
+
+@app.on_message(filters.command("start") & filters.private)
+async def start(client, message):
     await message.reply_text(
-        "🎬 **Video Stream Bot**\n\n"
-        "Send me a video and I'll give you:\n"
-        "• 📺 Stream link (plays in browser)\n"
-        "• 📥 Download link (saves to device)\n\n"
-        "✅ Supports: MP4, MKV, WebM, AVI, MOV\n"
-        "✅ Seeking enabled for all videos"
+        f"👋 Salam **{message.from_user.first_name}**!\n\n"
+        "Mujhe koi bhi File ya Video bhejo, main uska **Permanent Direct Link** bana dunga.\n"
+        "Ye link Lifetime kaam karega aur free hai.\n\n"
+        "🎬 **Stream:** Video browser mein play hogi (seekable)\n"
+        "⬇️ **Download:** File seedha download hogi\n\n"
+        "🚀 **Powered by:** Koyeb & Pyrogram"
     )
 
-@app.on_message(filters.video | filters.document)
-async def handle_video(client: Client, message: Message):
-    try:
-        fwd = await message.forward(CHANNEL_ID)
-        message_id = fwd.id
-        
-        media = message.video or message.document
-        file_name = getattr(media, 'file_name', None) or "video"
-        
-        base_url = "https://pyro-test-nikhil0987.koyeb.app"
-        stream_link = f"{base_url}/stream/{message_id}"
-        download_link = f"{base_url}/download/{message_id}"
-        
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📺 Stream", url=stream_link)],
-            [InlineKeyboardButton("📥 Download", url=download_link)]
-        ])
-        
-        await message.reply_text(
-            f"✅ **{file_name}**\n\n"
-            f"📺 Stream: `{stream_link}`\n"
-            f"📥 Download: `{download_link}`",
-            reply_markup=keyboard
-        )
-    except Exception as e:
-        await message.reply_text(f"❌ Error: {str(e)}")
+@app.on_message((filters.document | filters.video | filters.audio) & filters.private)
+async def file_handler(client, message):
+    status_msg = await message.reply_text("⏳ **Processing...**\nFile channel pe upload ho rahi hai...")
 
+    try:
+        log_msg = await message.copy(CHANNEL_ID)
+        msg_id = log_msg.id
+        
+        base_url = os.environ.get("APP_URL", "http://localhost:8080")
+        
+        stream_link = f"{base_url}/stream/{msg_id}"
+        download_link = f"{base_url}/download/{msg_id}"  # Alag download link
+        
+        file_size_mb = 0
+        if message.document:
+            file_size_mb = round(message.document.file_size / (1024 * 1024), 2)
+            fname = message.document.file_name
+        elif message.video:
+            file_size_mb = round(message.video.file_size / (1024 * 1024), 2)
+            fname = message.video.file_name or "video.mp4"
+        elif message.audio:
+            file_size_mb = round(message.audio.file_size / (1024 * 1024), 2)
+            fname = message.audio.file_name or "audio.mp3"
+            
+        response_text = (
+            "✅ **File Upload Complete!**\n\n"
+            f"📄 **File:** `{fname}`\n"
+            f"📦 **Size:** `{file_size_mb} MB`\n\n"
+            f"🎬 **Stream Link:**\n{stream_link}\n\n"
+            f"⬇️ **Download Link:**\n{download_link}\n\n"
+            "⏰ **Validity:** Lifetime ♾️\n"
+            "⚠️ *Note: Link tab tak chalega jab tak bot ON hai.*"
+        )
+        
+        await status_msg.edit_text(response_text, disable_web_page_preview=True)
+
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        await status_msg.edit_text(f"❌ Error aaya: {str(e)}")
+
+# --- MAIN EXECUTION ---
 async def start_services():
-    await app.start()
+    web_app = web.Application()
+    web_app.router.add_get('/stream/{message_id}', handle_stream)
+    web_app.router.add_get('/download/{message_id}', handle_download)  # Download route add kiya
+    web_app.router.add_get('/', health_check)
+
     runner = web.AppRunner(web_app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 8000)
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    print("Bot and Web Server started!")
+    logger.info(f"🌍 Web Server running on Port {PORT}")
+
+    logger.info("🤖 Bot starting...")
+    await app.start()
+    
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    asyncio.run(start_services())
-        
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(start_services())
+
+    
