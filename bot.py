@@ -1,229 +1,274 @@
-import base64
+import os
 import asyncio
+import logging
 from aiohttp import web
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 
-API_ID = 22401925
-API_HASH = "c7770339a011e6993e76c84e59d6641c"
-BOT_TOKEN = "7732754577:AAEzM8GklmpGmJy2cHWWbPqVwOCb3VXSZNU"
-PORT = 8080
-CHUNK_SIZE = 1024 * 1024  # 1MB chunks - memory leak fix
+# --- CONFIGURATION ---
+API_ID = int(os.environ.get("API_ID", "0")) 
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))
+PORT = int(os.environ.get("PORT", "8080"))
 
-app = Client("stream_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+CHUNK_SIZE = 1024 * 1024  # 1MB chunks
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-@app.on_message(filters.video | filters.document | filters.audio | filters.photo)
-async def handle_media(client, message):
-    chat_id = message.chat.id
-    msg_id = message.id
+app = Client(
+    "my_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    workdir="./sessions"  # ✅ FIX: Session folder
+)
 
-    if message.video:
-        filename = message.video.file_name or "video.mp4"
-    elif message.document:
-        filename = message.document.file_name or "document"
-    elif message.audio:
-        filename = message.audio.file_name or "audio.mp3"
-    elif message.photo:
-        filename = "photo.jpg"
-    else:
-        filename = "file"
+def get_file_info(msg):
+    file_name = "file"
+    file_size = 0
+    mime_type = "application/octet-stream"
 
-    raw = f"{chat_id}|{msg_id}|{filename}"
-    encoded = base64.urlsafe_b64encode(raw.encode()).decode()
-
-    stream_link = f"http://0.0.0.0:{PORT}/stream/{encoded}"
-    download_link = f"http://0.0.0.0:{PORT}/download/{encoded}"
-
-    await message.reply_text(
-        f"**Stream Link:**\n`{stream_link}`\n\n**Download Link:**\n`{download_link}`"
-    )
-
+    if msg.document:
+        file_name = msg.document.file_name or "document"
+        file_size = msg.document.file_size
+        mime_type = msg.document.mime_type or "application/octet-stream"
+    elif msg.video:
+        file_name = msg.video.file_name or "video.mp4"
+        file_size = msg.video.file_size
+        mime_type = msg.video.mime_type or "video/mp4"
+    elif msg.audio:
+        file_name = msg.audio.file_name or "audio.mp3"
+        file_size = msg.audio.file_size
+        mime_type = msg.audio.mime_type or "audio/mpeg"
+    
+    return file_name, file_size, mime_type
 
 async def handle_stream(request):
     try:
-        encoded = request.match_info.get("encoded")
-        decoded = base64.urlsafe_b64decode(encoded.encode()).decode()
-        chat_id, msg_id, filename = decoded.split("|")
-        chat_id = int(chat_id)
-        msg_id = int(msg_id)
-
-        msg = await app.get_messages(chat_id, msg_id)
+        message_id = int(request.match_info['message_id'])
+        msg = await app.get_messages(CHANNEL_ID, message_id)
+        
         if not msg or not msg.media:
-            return web.Response(status=404, text="File not found")
+            return web.Response(text="File not found or deleted.", status=404)
 
-        if msg.video:
-            file_size = msg.video.file_size
-            mime_type = msg.video.mime_type or "video/mp4"
-        elif msg.document:
-            file_size = msg.document.file_size
-            mime_type = msg.document.mime_type or "application/octet-stream"
-        elif msg.audio:
-            file_size = msg.audio.file_size
-            mime_type = msg.audio.mime_type or "audio/mpeg"
-        elif msg.photo:
-            file_size = msg.photo.file_size
-            mime_type = "image/jpeg"
-        else:
-            return web.Response(status=400, text="Unsupported media")
+        file_name, file_size, mime_type = get_file_info(msg)
 
-        # Range header parsing for seek support
-        range_header = request.headers.get("Range")
+        range_header = request.headers.get('Range')
         start = 0
         end = file_size - 1
 
         if range_header:
-            range_match = range_header.replace("bytes=", "").split("-")
-            start = int(range_match[0]) if range_match[0] else 0
-            end = int(range_match[1]) if range_match[1] and range_match[1].isdigit() else file_size - 1
+            range_str = range_header.replace('bytes=', '')
+            parts = range_str.split('-')
+            start = int(parts[0]) if parts[0] else 0
+            end = int(parts[1]) if parts[1] else file_size - 1
 
         content_length = end - start + 1
-        offset = start - (start % CHUNK_SIZE)
+        offset = start // CHUNK_SIZE
         skip_bytes = start % CHUNK_SIZE
+        
+        # ✅ FIX: Calculate limit (how many chunks to fetch)
+        limit = ((end - start) // CHUNK_SIZE) + 2
 
         headers = {
-            "Content-Type": mime_type,
-            "Content-Length": str(content_length),
-            "Accept-Ranges": "bytes",
-            "Content-Disposition": f'inline; filename="{filename}"',
+            'Content-Type': mime_type,
+            'Content-Disposition': f'inline; filename="{file_name}"',
+            'Content-Length': str(content_length),
+            'Accept-Ranges': 'bytes',
+            'Content-Range': f'bytes {start}-{end}/{file_size}',
+            'Cache-Control': 'no-cache',  # ✅ FIX: Prevent caching issues
         }
 
-        if range_header:
-            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-            response = web.StreamResponse(status=206, headers=headers)
-        else:
-            response = web.StreamResponse(status=200, headers=headers)
+        status = 206 if range_header else 200
+        resp = web.StreamResponse(status=status, headers=headers)
+        await resp.prepare(request)
 
-        await response.prepare(request)
+        bytes_sent = 0
+        first_chunk = True
 
-        sent = 0
-        async for chunk in app.stream_media(msg, offset=offset):
-            if skip_bytes > 0:
-                if len(chunk) <= skip_bytes:
-                    skip_bytes -= len(chunk)
-                    continue
+        # ✅ FIX: Added limit parameter
+        async for chunk in app.stream_media(msg, offset=offset, limit=limit):
+            if first_chunk and skip_bytes > 0:
                 chunk = chunk[skip_bytes:]
-                skip_bytes = 0
+                first_chunk = False
 
-            remaining = content_length - sent
+            remaining = content_length - bytes_sent
             if len(chunk) > remaining:
                 chunk = chunk[:remaining]
 
             if chunk:
-                await response.write(chunk)
-                sent += len(chunk)
+                await resp.write(chunk)
+                bytes_sent += len(chunk)
 
-            if sent >= content_length:
+            if bytes_sent >= content_length:
                 break
 
-        await response.write_eof()
-        return response
+        await resp.write_eof()
+        return resp
 
+    except asyncio.CancelledError:
+        logger.info("Stream cancelled by client")
+        raise
     except Exception as e:
-        print(f"Stream error: {e}")
-        return web.Response(status=500, text=str(e))
-
+        logger.error(f"Stream Error: {e}")
+        return web.Response(text="Link Expired or Server Error", status=500)
 
 async def handle_download(request):
     try:
-        encoded = request.match_info.get("encoded")
-        decoded = base64.urlsafe_b64decode(encoded.encode()).decode()
-        chat_id, msg_id, filename = decoded.split("|")
-        chat_id = int(chat_id)
-        msg_id = int(msg_id)
-
-        msg = await app.get_messages(chat_id, msg_id)
+        message_id = int(request.match_info['message_id'])
+        msg = await app.get_messages(CHANNEL_ID, message_id)
+        
         if not msg or not msg.media:
-            return web.Response(status=404, text="File not found")
+            return web.Response(text="File not found or deleted.", status=404)
 
-        if msg.video:
-            file_size = msg.video.file_size
-        elif msg.document:
-            file_size = msg.document.file_size
-        elif msg.audio:
-            file_size = msg.audio.file_size
-        elif msg.photo:
-            file_size = msg.photo.file_size
-        else:
-            return web.Response(status=400, text="Unsupported media")
+        file_name, file_size, mime_type = get_file_info(msg)
 
-        # Range header support for resume
-        range_header = request.headers.get("Range")
+        range_header = request.headers.get('Range')
         start = 0
         end = file_size - 1
 
         if range_header:
-            range_match = range_header.replace("bytes=", "").split("-")
-            start = int(range_match[0]) if range_match[0] else 0
-            end = int(range_match[1]) if range_match[1] and range_match[1].isdigit() else file_size - 1
+            range_str = range_header.replace('bytes=', '')
+            parts = range_str.split('-')
+            start = int(parts[0]) if parts[0] else 0
+            end = int(parts[1]) if parts[1] else file_size - 1
 
         content_length = end - start + 1
-        offset = start - (start % CHUNK_SIZE)
+        offset = start // CHUNK_SIZE
         skip_bytes = start % CHUNK_SIZE
+        
+        # ✅ FIX: Calculate limit
+        limit = ((end - start) // CHUNK_SIZE) + 2
 
         headers = {
-            "Content-Type": "application/octet-stream",
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Length": str(content_length),
-            "Accept-Ranges": "bytes",
+            'Content-Type': mime_type,
+            'Content-Disposition': f'attachment; filename="{file_name}"',
+            'Content-Length': str(content_length),
+            'Accept-Ranges': 'bytes',
+            'Cache-Control': 'no-cache',
         }
 
         if range_header:
-            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-            response = web.StreamResponse(status=206, headers=headers)
-        else:
-            response = web.StreamResponse(status=200, headers=headers)
+            headers['Content-Range'] = f'bytes {start}-{end}/{file_size}'
 
-        await response.prepare(request)
+        status = 206 if range_header else 200
+        resp = web.StreamResponse(status=status, headers=headers)
+        await resp.prepare(request)
 
-        sent = 0
-        async for chunk in app.stream_media(msg, offset=offset):
-            if skip_bytes > 0:
-                if len(chunk) <= skip_bytes:
-                    skip_bytes -= len(chunk)
-                    continue
+        bytes_sent = 0
+        first_chunk = True
+
+        # ✅ FIX: Added limit parameter
+        async for chunk in app.stream_media(msg, offset=offset, limit=limit):
+            if first_chunk and skip_bytes > 0:
                 chunk = chunk[skip_bytes:]
-                skip_bytes = 0
+                first_chunk = False
 
-            remaining = content_length - sent
+            remaining = content_length - bytes_sent
             if len(chunk) > remaining:
                 chunk = chunk[:remaining]
 
             if chunk:
-                await response.write(chunk)
-                sent += len(chunk)
+                await resp.write(chunk)
+                bytes_sent += len(chunk)
 
-            if sent >= content_length:
+            if bytes_sent >= content_length:
                 break
 
-        await response.write_eof()
-        return response
+        await resp.write_eof()
+        return resp
+
+    except asyncio.CancelledError:
+        logger.info("Download cancelled by client")
+        raise
+    except Exception as e:
+        logger.error(f"Download Error: {e}")
+        return web.Response(text="Link Expired or Server Error", status=500)
+
+async def health_check(request):
+    return web.Response(text="Bot is running! 24/7 Service.")
+
+@app.on_message(filters.command("start") & filters.private)
+async def start(client, message):
+    await message.reply_text(
+        f"👋 Salam **{message.from_user.first_name}**!\n\n"
+        "Mujhe koi bhi File ya Video bhejo, main uska **Permanent Direct Link** bana dunga.\n"
+        "Ye link Lifetime kaam karega aur free hai.\n\n"
+        "🎬 **Stream:** Video browser mein play hogi (seekable)\n"
+        "⬇️ **Download:** File seedha download hogi\n\n"
+        "🚀 **Powered by:** Koyeb & Pyrogram"
+    )
+
+@app.on_message((filters.document | filters.video | filters.audio) & filters.private)
+async def file_handler(client, message):
+    status_msg = await message.reply_text("⏳ **Processing...**\nFile channel pe upload ho rahi hai...")
+
+    try:
+        log_msg = await message.copy(CHANNEL_ID)
+        msg_id = log_msg.id
+        
+        base_url = os.environ.get("APP_URL", "http://localhost:8080")
+        
+        stream_link = f"{base_url}/stream/{msg_id}"
+        download_link = f"{base_url}/download/{msg_id}"
+        
+        file_size_mb = 0
+        if message.document:
+            file_size_mb = round(message.document.file_size / (1024 * 1024), 2)
+            fname = message.document.file_name
+        elif message.video:
+            file_size_mb = round(message.video.file_size / (1024 * 1024), 2)
+            fname = message.video.file_name or "video.mp4"
+        elif message.audio:
+            file_size_mb = round(message.audio.file_size / (1024 * 1024), 2)
+            fname = message.audio.file_name or "audio.mp3"
+            
+        response_text = (
+            "✅ **File Upload Complete!**\n\n"
+            f"📄 **File:** `{fname}`\n"
+            f"📦 **Size:** `{file_size_mb} MB`\n\n"
+            f"🎬 **Stream Link:**\n{stream_link}\n\n"
+            f"⬇️ **Download Link:**\n{download_link}\n\n"
+            "⏰ **Validity:** Lifetime ♾️\n"
+            "⚠️ *Note: Link tab tak chalega jab tak bot ON hai.*"
+        )
+        
+        await status_msg.edit_text(response_text, disable_web_page_preview=True)
 
     except Exception as e:
-        print(f"Download error: {e}")
-        return web.Response(status=500, text=str(e))
-
+        logger.error(f"Error: {e}")
+        await status_msg.edit_text(f"❌ Error aaya: {str(e)}")
 
 async def start_services():
+    # ✅ FIX: Create sessions folder
+    os.makedirs("./sessions", exist_ok=True)
+    
     await app.start()
-    print("Bot started!")
+    logger.info("🤖 Bot started successfully!")
 
     web_app = web.Application()
-    web_app.router.add_get("/stream/{encoded}", handle_stream)
-    web_app.router.add_get("/download/{encoded}", handle_download)
+    web_app.router.add_get('/stream/{message_id}', handle_stream)
+    web_app.router.add_get('/download/{message_id}', handle_download)
+    web_app.router.add_get('/', health_check)
 
     runner = web.AppRunner(web_app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    print(f"Server running on port {PORT}")
+    logger.info(f"🌍 Web Server running on Port {PORT}")
 
     try:
+        from pyrogram import idle
         await idle()
+    except ImportError:
+        await asyncio.Event().wait()
     finally:
         await runner.cleanup()
         await app.stop()
 
-
 if __name__ == "__main__":
-    asyncio.get_event_loop().run_until_complete(start_services())
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(start_services())
     
