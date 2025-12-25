@@ -195,7 +195,7 @@ async def start(client, message):
         "Ye link Lifetime kaam karega aur free hai.\n\n"
         "🎬 **Stream:** Video browser mein play hogi (seekable)\n"
         "⬇️ **Download:** File seedha download hogi\n\n"
-        "🚀 **Powered by:** Koyeb & Pyrogram"
+        "🚀 **Created By:** SAIFSALER"
     )
 
 @app.on_message((filters.document | filters.video | filters.audio) & filters.private)
@@ -268,5 +268,4 @@ async def start_services():
 
 if __name__ == "__main__":
     asyncio.get_event_loop().run_until_complete(start_services())
-
     
