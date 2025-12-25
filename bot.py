@@ -1,7 +1,7 @@
 import os
-import time
 import asyncio
 import logging
+import signal
 from aiohttp import web
 from pyrogram import Client, filters, enums
 
@@ -12,6 +12,9 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))
 
 PORT = int(os.environ.get("PORT", "8080"))
+
+# Chunk size for memory-efficient streaming (1MB chunks)
+CHUNK_SIZE = 1024 * 1024
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -44,7 +47,7 @@ def get_file_info(msg):
     
     return file_name, file_size, mime_type
 
-# --- STREAM ROUTE (Video play hogi browser mein) ---
+# --- STREAM ROUTE (Video play hogi browser mein with proper seek support) ---
 async def handle_stream(request):
     try:
         message_id = int(request.match_info['message_id'])
@@ -66,45 +69,66 @@ async def handle_stream(request):
             start = int(parts[0]) if parts[0] else 0
             end = int(parts[1]) if parts[1] else file_size - 1
 
+        # Limit chunk size to prevent memory overload
+        if end - start + 1 > CHUNK_SIZE * 10:
+            end = start + (CHUNK_SIZE * 10) - 1
+            if end >= file_size:
+                end = file_size - 1
+
         content_length = end - start + 1
 
         headers = {
             'Content-Type': mime_type,
-            'Content-Disposition': f'inline; filename="{file_name}"',  # INLINE = Play in browser
+            'Content-Disposition': f'inline; filename="{file_name}"',
             'Content-Length': str(content_length),
             'Accept-Ranges': 'bytes',
-            'Content-Range': f'bytes {start}-{end}/{file_size}'
+            'Content-Range': f'bytes {start}-{end}/{file_size}',
+            'Cache-Control': 'no-cache',
         }
 
         status = 206 if range_header else 200
         resp = web.StreamResponse(status=status, headers=headers)
         await resp.prepare(request)
 
-        current_pos = 0
-        async for chunk in app.stream_media(msg):
-            chunk_start = current_pos
-            chunk_end = current_pos + len(chunk) - 1
+        # Calculate offset and limit for Pyrogram stream_media
+        # Pyrogram uses 1MB chunks internally
+        offset = start // CHUNK_SIZE
+        bytes_to_skip = start % CHUNK_SIZE
+        bytes_remaining = content_length
 
-            if chunk_end < start:
-                current_pos += len(chunk)
-                continue
-
-            if chunk_start > end:
+        async for chunk in app.stream_media(msg, offset=offset):
+            if bytes_remaining <= 0:
                 break
 
-            write_start = max(0, start - chunk_start)
-            write_end = min(len(chunk), end - chunk_start + 1)
-            await resp.write(chunk[write_start:write_end])
+            # Skip bytes at the beginning of first chunk if needed
+            if bytes_to_skip > 0:
+                chunk = chunk[bytes_to_skip:]
+                bytes_to_skip = 0
 
-            current_pos += len(chunk)
-            
+            # Only write the required bytes
+            if len(chunk) > bytes_remaining:
+                chunk = chunk[:bytes_remaining]
+
+            try:
+                await resp.write(chunk)
+                bytes_remaining -= len(chunk)
+            except ConnectionResetError:
+                logger.info("Client disconnected during stream")
+                break
+            except Exception as e:
+                logger.error(f"Write error: {e}")
+                break
+
         return resp
 
+    except asyncio.CancelledError:
+        logger.info("Stream request cancelled by client")
+        raise
     except Exception as e:
         logger.error(f"Stream Error: {e}")
         return web.Response(text="Link Expired or Server Error", status=500)
 
-# --- DOWNLOAD ROUTE (File download hogi) ---
+# --- DOWNLOAD ROUTE (File download hogi with memory optimization) ---
 async def handle_download(request):
     try:
         message_id = int(request.match_info['message_id'])
@@ -115,20 +139,66 @@ async def handle_download(request):
 
         file_name, file_size, mime_type = get_file_info(msg)
 
+        # Range support for download resume
+        range_header = request.headers.get('Range')
+        start = 0
+        end = file_size - 1
+
+        if range_header:
+            range_str = range_header.replace('bytes=', '')
+            parts = range_str.split('-')
+            start = int(parts[0]) if parts[0] else 0
+            end = int(parts[1]) if parts[1] else file_size - 1
+
+        content_length = end - start + 1
+
         headers = {
             'Content-Type': mime_type,
-            'Content-Disposition': f'attachment; filename="{file_name}"',  # ATTACHMENT = Force download
-            'Content-Length': str(file_size)
+            'Content-Disposition': f'attachment; filename="{file_name}"',
+            'Content-Length': str(content_length),
+            'Accept-Ranges': 'bytes',
         }
 
-        resp = web.StreamResponse(status=200, headers=headers)
+        if range_header:
+            headers['Content-Range'] = f'bytes {start}-{end}/{file_size}'
+            status = 206
+        else:
+            status = 200
+
+        resp = web.StreamResponse(status=status, headers=headers)
         await resp.prepare(request)
 
-        async for chunk in app.stream_media(msg):
-            await resp.write(chunk)
-            
+        # Calculate offset for efficient seeking
+        offset = start // CHUNK_SIZE
+        bytes_to_skip = start % CHUNK_SIZE
+        bytes_remaining = content_length
+
+        async for chunk in app.stream_media(msg, offset=offset):
+            if bytes_remaining <= 0:
+                break
+
+            if bytes_to_skip > 0:
+                chunk = chunk[bytes_to_skip:]
+                bytes_to_skip = 0
+
+            if len(chunk) > bytes_remaining:
+                chunk = chunk[:bytes_remaining]
+
+            try:
+                await resp.write(chunk)
+                bytes_remaining -= len(chunk)
+            except ConnectionResetError:
+                logger.info("Client disconnected during download")
+                break
+            except Exception as e:
+                logger.error(f"Write error: {e}")
+                break
+
         return resp
 
+    except asyncio.CancelledError:
+        logger.info("Download request cancelled by client")
+        raise
     except Exception as e:
         logger.error(f"Download Error: {e}")
         return web.Response(text="Link Expired or Server Error", status=500)
@@ -160,7 +230,7 @@ async def file_handler(client, message):
         base_url = os.environ.get("APP_URL", "http://localhost:8080")
         
         stream_link = f"{base_url}/stream/{msg_id}"
-        download_link = f"{base_url}/download/{msg_id}"  # Alag download link
+        download_link = f"{base_url}/download/{msg_id}"
         
         file_size_mb = 0
         if message.document:
@@ -189,11 +259,19 @@ async def file_handler(client, message):
         logger.error(f"Error: {e}")
         await status_msg.edit_text(f"❌ Error aaya: {str(e)}")
 
-# --- MAIN EXECUTION ---
+# --- GRACEFUL SHUTDOWN HANDLER ---
+async def shutdown(runner, site):
+    logger.info("🛑 Shutting down gracefully...")
+    await app.stop()
+    await site.stop()
+    await runner.cleanup()
+    logger.info("✅ Shutdown complete")
+
+# --- MAIN EXECUTION (Modern asyncio with graceful shutdown) ---
 async def start_services():
     web_app = web.Application()
     web_app.router.add_get('/stream/{message_id}', handle_stream)
-    web_app.router.add_get('/download/{message_id}', handle_download)  # Download route add kiya
+    web_app.router.add_get('/download/{message_id}', handle_download)
     web_app.router.add_get('/', health_check)
 
     runner = web.AppRunner(web_app)
@@ -204,11 +282,28 @@ async def start_services():
 
     logger.info("🤖 Bot starting...")
     await app.start()
+
+    # Graceful shutdown handling
+    stop_event = asyncio.Event()
     
-    await asyncio.Event().wait()
+    def signal_handler():
+        logger.info("Received shutdown signal")
+        stop_event.set()
+    
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, signal_handler)
+        except NotImplementedError:
+            # Windows doesn't support add_signal_handler
+            pass
+
+    await stop_event.wait()
+    await shutdown(runner, site)
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(start_services())
-
-    
+    try:
+        asyncio.run(start_services())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+        
