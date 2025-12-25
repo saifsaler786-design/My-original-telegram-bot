@@ -11,18 +11,17 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))
 PORT = int(os.environ.get("PORT", "8080"))
 
+# ✅ FIX 1: Chunk size for memory optimization (1GB+ files ke liye)
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ✅ FIX: workdir add kiya session save ke liye
 app = Client(
     "my_bot",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    workdir="./sessions"
+    bot_token=BOT_TOKEN
 )
 
 def get_file_info(msg):
@@ -31,20 +30,21 @@ def get_file_info(msg):
     mime_type = "application/octet-stream"
 
     if msg.document:
-        file_name = msg.document.file_name or "document"
-        file_size = msg.document.file_size or 0
-        mime_type = msg.document.mime_type or "application/octet-stream"
+        file_name = msg.document.file_name
+        file_size = msg.document.file_size
+        mime_type = msg.document.mime_type
     elif msg.video:
         file_name = msg.video.file_name or "video.mp4"
-        file_size = msg.video.file_size or 0
-        mime_type = msg.video.mime_type or "video/mp4"
+        file_size = msg.video.file_size
+        mime_type = msg.video.mime_type
     elif msg.audio:
         file_name = msg.audio.file_name or "audio.mp3"
-        file_size = msg.audio.file_size or 0
-        mime_type = msg.audio.mime_type or "audio/mpeg"
+        file_size = msg.audio.file_size
+        mime_type = msg.audio.mime_type
     
     return file_name, file_size, mime_type
 
+# ✅ FIX 2: Professional Seek Support with offset parameter
 async def handle_stream(request):
     try:
         message_id = int(request.match_info['message_id'])
@@ -55,6 +55,7 @@ async def handle_stream(request):
 
         file_name, file_size, mime_type = get_file_info(msg)
 
+        # Range header parsing for seek support
         range_header = request.headers.get('Range')
         start = 0
         end = file_size - 1
@@ -66,19 +67,17 @@ async def handle_stream(request):
             end = int(parts[1]) if parts[1] else file_size - 1
 
         content_length = end - start + 1
+
+        # ✅ FIX: Calculate offset for Pyrogram stream_media
         offset = start // CHUNK_SIZE
         skip_bytes = start % CHUNK_SIZE
-        
-        # ✅ FIX: limit parameter add kiya
-        limit = ((end - start) // CHUNK_SIZE) + 2
 
         headers = {
             'Content-Type': mime_type,
             'Content-Disposition': f'inline; filename="{file_name}"',
             'Content-Length': str(content_length),
             'Accept-Ranges': 'bytes',
-            'Content-Range': f'bytes {start}-{end}/{file_size}',
-            'Cache-Control': 'no-cache'
+            'Content-Range': f'bytes {start}-{end}/{file_size}'
         }
 
         status = 206 if range_header else 200
@@ -88,12 +87,14 @@ async def handle_stream(request):
         bytes_sent = 0
         first_chunk = True
 
-        # ✅ FIX: limit parameter use kiya
-        async for chunk in app.stream_media(msg, offset=offset, limit=limit):
+        # ✅ FIX 3: Use offset parameter - Memory efficient streaming
+        async for chunk in app.stream_media(msg, offset=offset):
+            # Skip bytes from first chunk if needed
             if first_chunk and skip_bytes > 0:
                 chunk = chunk[skip_bytes:]
                 first_chunk = False
 
+            # Don't send more than requested
             remaining = content_length - bytes_sent
             if len(chunk) > remaining:
                 chunk = chunk[:remaining]
@@ -125,6 +126,7 @@ async def handle_download(request):
 
         file_name, file_size, mime_type = get_file_info(msg)
 
+        # ✅ FIX: Range support for download resume
         range_header = request.headers.get('Range')
         start = 0
         end = file_size - 1
@@ -138,16 +140,12 @@ async def handle_download(request):
         content_length = end - start + 1
         offset = start // CHUNK_SIZE
         skip_bytes = start % CHUNK_SIZE
-        
-        # ✅ FIX: limit parameter add kiya
-        limit = ((end - start) // CHUNK_SIZE) + 2
 
         headers = {
             'Content-Type': mime_type,
             'Content-Disposition': f'attachment; filename="{file_name}"',
             'Content-Length': str(content_length),
             'Accept-Ranges': 'bytes',
-            'Cache-Control': 'no-cache'
         }
 
         if range_header:
@@ -160,8 +158,7 @@ async def handle_download(request):
         bytes_sent = 0
         first_chunk = True
 
-        # ✅ FIX: limit parameter use kiya
-        async for chunk in app.stream_media(msg, offset=offset, limit=limit):
+        async for chunk in app.stream_media(msg, offset=offset):
             if first_chunk and skip_bytes > 0:
                 chunk = chunk[skip_bytes:]
                 first_chunk = False
@@ -241,13 +238,13 @@ async def file_handler(client, message):
         logger.error(f"Error: {e}")
         await status_msg.edit_text(f"❌ Error aaya: {str(e)}")
 
+# ✅ FIX 4: Graceful Shutdown with proper cleanup
 async def start_services():
-    # ✅ FIX: sessions folder create karo
-    os.makedirs("./sessions", exist_ok=True)
-    
+    # Start bot first
     await app.start()
     logger.info("🤖 Bot started successfully!")
 
+    # Setup web server
     web_app = web.Application()
     web_app.router.add_get('/stream/{message_id}', handle_stream)
     web_app.router.add_get('/download/{message_id}', handle_download)
@@ -259,6 +256,7 @@ async def start_services():
     await site.start()
     logger.info(f"🌍 Web Server running on Port {PORT}")
 
+    # ✅ FIX: Keep running with proper idle
     try:
         from pyrogram import idle
         await idle()
@@ -268,7 +266,7 @@ async def start_services():
         await runner.cleanup()
         await app.stop()
 
-# ✅ MAIN FIX: Python 3.10+ ke liye correct method
 if __name__ == "__main__":
-    asyncio.run(start_services())
+    asyncio.get_event_loop().run_until_complete(start_services())
+
     
