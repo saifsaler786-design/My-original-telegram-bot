@@ -16,12 +16,13 @@ CHUNK_SIZE = 1024 * 1024  # 1MB chunks
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ✅ FIX: workdir add kiya session save ke liye
 app = Client(
     "my_bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workdir="./sessions"  # ✅ FIX: Session folder
+    workdir="./sessions"
 )
 
 def get_file_info(msg):
@@ -31,15 +32,15 @@ def get_file_info(msg):
 
     if msg.document:
         file_name = msg.document.file_name or "document"
-        file_size = msg.document.file_size
+        file_size = msg.document.file_size or 0
         mime_type = msg.document.mime_type or "application/octet-stream"
     elif msg.video:
         file_name = msg.video.file_name or "video.mp4"
-        file_size = msg.video.file_size
+        file_size = msg.video.file_size or 0
         mime_type = msg.video.mime_type or "video/mp4"
     elif msg.audio:
         file_name = msg.audio.file_name or "audio.mp3"
-        file_size = msg.audio.file_size
+        file_size = msg.audio.file_size or 0
         mime_type = msg.audio.mime_type or "audio/mpeg"
     
     return file_name, file_size, mime_type
@@ -68,7 +69,7 @@ async def handle_stream(request):
         offset = start // CHUNK_SIZE
         skip_bytes = start % CHUNK_SIZE
         
-        # ✅ FIX: Calculate limit (how many chunks to fetch)
+        # ✅ FIX: limit parameter add kiya
         limit = ((end - start) // CHUNK_SIZE) + 2
 
         headers = {
@@ -77,7 +78,7 @@ async def handle_stream(request):
             'Content-Length': str(content_length),
             'Accept-Ranges': 'bytes',
             'Content-Range': f'bytes {start}-{end}/{file_size}',
-            'Cache-Control': 'no-cache',  # ✅ FIX: Prevent caching issues
+            'Cache-Control': 'no-cache'
         }
 
         status = 206 if range_header else 200
@@ -87,7 +88,7 @@ async def handle_stream(request):
         bytes_sent = 0
         first_chunk = True
 
-        # ✅ FIX: Added limit parameter
+        # ✅ FIX: limit parameter use kiya
         async for chunk in app.stream_media(msg, offset=offset, limit=limit):
             if first_chunk and skip_bytes > 0:
                 chunk = chunk[skip_bytes:]
@@ -138,7 +139,7 @@ async def handle_download(request):
         offset = start // CHUNK_SIZE
         skip_bytes = start % CHUNK_SIZE
         
-        # ✅ FIX: Calculate limit
+        # ✅ FIX: limit parameter add kiya
         limit = ((end - start) // CHUNK_SIZE) + 2
 
         headers = {
@@ -146,7 +147,7 @@ async def handle_download(request):
             'Content-Disposition': f'attachment; filename="{file_name}"',
             'Content-Length': str(content_length),
             'Accept-Ranges': 'bytes',
-            'Cache-Control': 'no-cache',
+            'Cache-Control': 'no-cache'
         }
 
         if range_header:
@@ -159,7 +160,7 @@ async def handle_download(request):
         bytes_sent = 0
         first_chunk = True
 
-        # ✅ FIX: Added limit parameter
+        # ✅ FIX: limit parameter use kiya
         async for chunk in app.stream_media(msg, offset=offset, limit=limit):
             if first_chunk and skip_bytes > 0:
                 chunk = chunk[skip_bytes:]
@@ -241,7 +242,7 @@ async def file_handler(client, message):
         await status_msg.edit_text(f"❌ Error aaya: {str(e)}")
 
 async def start_services():
-    # ✅ FIX: Create sessions folder
+    # ✅ FIX: sessions folder create karo
     os.makedirs("./sessions", exist_ok=True)
     
     await app.start()
@@ -267,8 +268,7 @@ async def start_services():
         await runner.cleanup()
         await app.stop()
 
+# ✅ MAIN FIX: Python 3.10+ ke liye correct method
 if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(start_services())
+    asyncio.run(start_services())
     
