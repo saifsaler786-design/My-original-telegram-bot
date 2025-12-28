@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import mimetypes
 from aiohttp import web
 from pyrogram import Client, filters
 
@@ -41,6 +42,11 @@ def get_file_info(msg):
         file_name = msg.audio.file_name or "audio.mp3"
         file_size = msg.audio.file_size
         mime_type = msg.audio.mime_type
+
+    # --- YE DO LINES NAYI HAIN (MKV FIX) ---
+    if file_name and file_name.lower().endswith(".mkv"):
+        mime_type = "video/x-matroska"  # Browser ko batayega ke ye Video hai
+    # ---------------------------------------
     
     return file_name, file_size, mime_type
 
