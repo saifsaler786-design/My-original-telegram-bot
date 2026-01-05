@@ -93,9 +93,10 @@ async def handle_stream(request):
         # ✅ FIX 3: Use offset parameter - Memory efficient streaming
         async for chunk in app.stream_media(msg, offset=offset):
             # Skip bytes from first chunk if needed
-            if first_chunk and skip_bytes > 0:
-                chunk = chunk[skip_bytes:]
-                first_chunk = False
+            if first_chunk:
+    if skip_bytes > 0:
+        chunk = chunk[skip_bytes:]
+    first_chunk = False
 
             # Don't send more than requested
             remaining = content_length - bytes_sent
