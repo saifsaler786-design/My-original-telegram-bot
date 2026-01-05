@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 from aiohttp import web
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 
 # --- CONFIGURATION ---
 API_ID = int(os.environ.get("API_ID", "0")) 
@@ -11,8 +11,8 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))
 PORT = int(os.environ.get("PORT", "8080"))
 
-# Chunk size optimization
-CHUNK_SIZE = 1024 * 1024  # 1MB
+# Chunk Size (1MB)
+CHUNK_SIZE = 1024 * 1024 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -44,12 +44,18 @@ def get_file_info(msg):
     
     return file_name, file_size, mime_type
 
-# ✅ NEW: HTML Player Template with Custom Buttons
-# Ye function HTML page generate karega jisme +10s aur -10s ke buttons hain
+# ✅ UPDATED HTML PLAYER (No Download Button)
 async def stream_player_page(request):
     try:
-        message_id = request.match_info['message_id']
-        # Hum actual video stream karne ke liye '/stream-data/' route use karenge
+        message_id = int(request.match_info['message_id'])
+        msg = await app.get_messages(CHANNEL_ID, message_id)
+        
+        if not msg or not msg.media:
+            return web.Response(text="File not found or deleted.", status=404)
+
+        file_name, _, _ = get_file_info(msg)
+        
+        # Sirf Stream URL generate hoga
         stream_url = f"/stream-data/{message_id}"
         
         html_content = f"""
@@ -58,36 +64,52 @@ async def stream_player_page(request):
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Video Player</title>
+            <title>{file_name}</title>
             <style>
-                body {{ margin: 0; background-color: #000; color: white; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; font-family: sans-serif; }}
-                video {{ width: 100%; max-width: 800px; max-height: 80vh; background: #000; }}
-                .controls {{ margin-top: 15px; display: flex; gap: 20px; }}
+                body {{ margin: 0; background-color: #121212; color: white; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; }}
+                
+                .player-container {{ width: 95%; max-width: 900px; position: relative; }}
+                video {{ width: 100%; border-radius: 8px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); background: #000; }}
+                
+                h2 {{ margin: 10px 0; font-size: 1.2rem; word-break: break-all; color: #e0e0e0; text-align: center; }}
+                
+                .controls-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); gap: 10px; margin-top: 15px; width: 100%; }}
+                
                 .btn {{ 
-                    padding: 10px 20px; 
-                    font-size: 18px; 
-                    background-color: #2481cc; 
-                    color: white; 
-                    border: none; 
-                    border-radius: 5px; 
-                    cursor: pointer; 
-                    user-select: none;
+                    padding: 12px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; transition: 0.2s; color: white;
+                    display: flex; align-items: center; justify-content: center; gap: 5px;
                 }}
-                .btn:active {{ background-color: #1a5c91; transform: scale(0.95); }}
-                .info {{ margin-top: 10px; color: #aaa; font-size: 14px; }}
+                
+                .btn-seek {{ background-color: #2b3a42; }}
+                .btn-seek:hover {{ background-color: #3d525e; }}
+                
+                .btn-speed {{ background-color: #2b3a42; }}
+                .btn-speed:hover {{ background-color: #3d525e; }}
+                
+                .info {{ margin-top: 20px; font-size: 0.8rem; color: #666; text-align: center; }}
             </style>
         </head>
         <body>
-            <video id="player" controls autoplay playsinline>
-                <source src="{stream_url}" type="video/mp4">
-                Your browser does not support the video tag.
-            </video>
+            <div class="player-container">
+                <h2>📺 {file_name}</h2>
+                
+                <video id="player" controls autoplay playsinline preload="metadata">
+                    <source src="{stream_url}" type="video/mp4">
+                    Your browser does not support the video tag.
+                </video>
 
-            <div class="controls">
-                <button class="btn" onclick="seek(-10)">⏪ -10s</button>
-                <button class="btn" onclick="seek(10)">+10s ⏩</button>
+                <div class="controls-grid">
+                    <button class="btn btn-seek" onclick="seek(-10)">⏪ -10s</button>
+                    <button class="btn btn-seek" onclick="seek(10)">+10s ⏩</button>
+                    
+                    <button class="btn btn-speed" onclick="setSpeed(1.0)">1x</button>
+                    <button class="btn btn-speed" onclick="setSpeed(1.5)">1.5x</button>
+                    <button class="btn btn-speed" onclick="setSpeed(2.0)">2x</button>
+                </div>
+                <!-- Download button removed -->
             </div>
-            <div class="info">Custom Player by SAIFSALER</div>
+
+            <div class="info">Space: Play/Pause | F: Fullscreen | Arrows: Seek</div>
 
             <script>
                 const video = document.getElementById('player');
@@ -95,11 +117,28 @@ async def stream_player_page(request):
                 function seek(seconds) {{
                     video.currentTime += seconds;
                 }}
+                
+                function setSpeed(rate) {{
+                    video.playbackRate = rate;
+                }}
 
-                // Keyboard support (Left/Right arrows)
                 document.addEventListener('keydown', function(e) {{
-                    if (e.code === 'ArrowRight') seek(10);
-                    if (e.code === 'ArrowLeft') seek(-10);
+                    if(['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].indexOf(e.code) > -1) {{
+                        e.preventDefault();
+                    }}
+
+                    switch(e.code) {{
+                        case 'ArrowLeft': seek(-10); break;
+                        case 'ArrowRight': seek(10); break;
+                        case 'Space': 
+                            if (video.paused) video.play(); 
+                            else video.pause(); 
+                            break;
+                        case 'KeyF':
+                            if (document.fullscreenElement) document.exitFullscreen();
+                            else video.requestFullscreen();
+                            break;
+                    }}
                 }});
             </script>
         </body>
@@ -110,14 +149,14 @@ async def stream_player_page(request):
         logger.error(f"Page Error: {e}")
         return web.Response(text="Server Error", status=500)
 
-# ✅ RENAMED: Ye purana 'handle_stream' hai, ab ye background mein data supply karega
+# Backend Stream Handler (Invisible to user)
 async def media_stream_handler(request):
     try:
         message_id = int(request.match_info['message_id'])
         msg = await app.get_messages(CHANNEL_ID, message_id)
         
         if not msg or not msg.media:
-            return web.Response(text="File not found or deleted.", status=404)
+            return web.Response(text="File not found.", status=404)
 
         file_name, file_size, mime_type = get_file_info(msg)
 
@@ -170,19 +209,20 @@ async def media_stream_handler(request):
         return resp
 
     except asyncio.CancelledError:
-        logger.info("Stream cancelled by client")
+        logger.info("Stream cancelled")
         raise
     except Exception as e:
         logger.error(f"Stream Error: {e}")
-        return web.Response(text="Link Expired or Server Error", status=500)
+        return web.Response(text="Server Error", status=500)
 
+# Download Handler (Iska link Bot Chat mein milega, Player mein nahi)
 async def handle_download(request):
     try:
         message_id = int(request.match_info['message_id'])
         msg = await app.get_messages(CHANNEL_ID, message_id)
         
         if not msg or not msg.media:
-            return web.Response(text="File not found or deleted.", status=404)
+            return web.Response(text="File not found.", status=404)
 
         file_name, file_size, mime_type = get_file_info(msg)
 
@@ -237,11 +277,10 @@ async def handle_download(request):
         return resp
 
     except asyncio.CancelledError:
-        logger.info("Download cancelled by client")
         raise
     except Exception as e:
         logger.error(f"Download Error: {e}")
-        return web.Response(text="Link Expired or Server Error", status=500)
+        return web.Response(text="Server Error", status=500)
 
 async def health_check(request):
     return web.Response(text="Bot is running! 24/7 Service.")
@@ -250,16 +289,15 @@ async def health_check(request):
 async def start(client, message):
     await message.reply_text(
         f"👋 Salam **{message.from_user.first_name}**!\n\n"
-        "Mujhe koi bhi File ya Video bhejo, main uska **Permanent Direct Link** bana dunga.\n"
-        "Ye link Lifetime kaam karega aur free hai.\n\n"
-        "🎬 **Stream:** Video browser mein play hogi (With Fast Forward Buttons)\n"
-        "⬇️ **Download:** File seedha download hogi\n\n"
+        "Mujhe koi bhi File bhejo, main uska Link bana dunga.\n\n"
+        "🎬 **Stream:** Advanced Player (No Download Button)\n"
+        "⬇️ **Download:** Direct Download Link\n\n"
         "🚀 **Created By:** SAIFSALER"
     )
 
 @app.on_message((filters.document | filters.video | filters.audio) & filters.private)
 async def file_handler(client, message):
-    status_msg = await message.reply_text("⏳ **Processing...**\nFile channel pe upload ho rahi hai...")
+    status_msg = await message.reply_text("⏳ **Processing...**")
 
     try:
         log_msg = await message.copy(CHANNEL_ID)
@@ -267,70 +305,47 @@ async def file_handler(client, message):
         
         base_url = os.environ.get("APP_URL", "http://localhost:8080")
         
-        # URL wohi rahega, lekin ab ye HTML page kholega
         stream_link = f"{base_url}/stream/{msg_id}"
         download_link = f"{base_url}/download/{msg_id}"
         
-        file_size_mb = 0
-        fname = "Unknown"
-        if message.document:
-            file_size_mb = round(message.document.file_size / (1024 * 1024), 2)
-            fname = message.document.file_name
-        elif message.video:
-            file_size_mb = round(message.video.file_size / (1024 * 1024), 2)
-            fname = message.video.file_name or "video.mp4"
-        elif message.audio:
-            file_size_mb = round(message.audio.file_size / (1024 * 1024), 2)
-            fname = message.audio.file_name or "audio.mp3"
+        fname = "File"
+        if message.document: fname = message.document.file_name
+        elif message.video: fname = message.video.file_name or "video.mp4"
+        elif message.audio: fname = message.audio.file_name or "audio.mp3"
             
         response_text = (
-            "✅ **File Upload Complete!**\n\n"
-            f"📄 **File:** `{fname}`\n"
-            f"📦 **Size:** `{file_size_mb} MB`\n\n"
-            f"🎬 **Stream Link (Player):**\n{stream_link}\n\n"
-            f"⬇️ **Download Link:**\n{download_link}\n\n"
-            "⏰ **Validity:** Lifetime ♾️\n"
-            "⚠️ *Note: Link tab tak chalega jab tak bot ON hai.*"
+            "✅ **Link Generated!**\n\n"
+            f"📄 **File:** `{fname}`\n\n"
+            f"🎬 **Watch Online:**\n{stream_link}\n\n"
+            f"⬇️ **Download File:**\n{download_link}\n\n"
+            "⚠️ *Link Lifetime valid hai.*"
         )
         
         await status_msg.edit_text(response_text, disable_web_page_preview=True)
 
     except Exception as e:
         logger.error(f"Error: {e}")
-        await status_msg.edit_text(f"❌ Error aaya: {str(e)}")
+        await status_msg.edit_text(f"❌ Error: {str(e)}")
 
 async def start_services():
     await app.start()
-    logger.info("🤖 Bot started successfully!")
+    logger.info("🤖 Bot started!")
 
     web_app = web.Application()
-    
-    # ✅ ROUTES UPDATE:
-    # 1. /stream/ID -> Ab HTML Player dikhayega
     web_app.router.add_get('/stream/{message_id}', stream_player_page)
-    
-    # 2. /stream-data/ID -> Ye video ka raw data supply karega (Hidden route)
     web_app.router.add_get('/stream-data/{message_id}', media_stream_handler)
-    
-    # 3. Download waise hi rahega
     web_app.router.add_get('/download/{message_id}', handle_download)
-    
     web_app.router.add_get('/', health_check)
 
     runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    logger.info(f"🌍 Web Server running on Port {PORT}")
+    logger.info(f"🌍 Server running on Port {PORT}")
 
-    try:
-        from pyrogram import idle
-        await idle()
-    except ImportError:
-        await asyncio.Event().wait()
-    finally:
-        await runner.cleanup()
-        await app.stop()
+    await idle()
+    await runner.cleanup()
+    await app.stop()
 
 if __name__ == "__main__":
     asyncio.get_event_loop().run_until_complete(start_services())
