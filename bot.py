@@ -12,7 +12,7 @@ CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))
 PORT = int(os.environ.get("PORT", "8080"))
 
 # ✅ FIX 1: Chunk size for memory optimization (1GB+ files ke liye)
-CHUNK_SIZE = 4 * 1024 * 1024  # 4MB chunks (better for long videos)
+CHUNK_SIZE = 1024 * 1024  # 1MB chunks
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -73,15 +73,12 @@ async def handle_stream(request):
         skip_bytes = start % CHUNK_SIZE
 
         headers = {
-    'Content-Type': mime_type,
-    'Content-Disposition': f'inline; filename="{file_name}"',
-    'Content-Length': str(content_length),
-    'Accept-Ranges': 'bytes',
-    'Content-Range': f'bytes {start}-{end}/{file_size}',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive'
-}
-
+            'Content-Type': mime_type,
+            'Content-Disposition': f'inline; filename="{file_name}"',
+            'Content-Length': str(content_length),
+            'Accept-Ranges': 'bytes',
+            'Content-Range': f'bytes {start}-{end}/{file_size}'
+        }
 
         status = 206 if range_header else 200
         resp = web.StreamResponse(status=status, headers=headers)
@@ -93,10 +90,9 @@ async def handle_stream(request):
         # ✅ FIX 3: Use offset parameter - Memory efficient streaming
         async for chunk in app.stream_media(msg, offset=offset):
             # Skip bytes from first chunk if needed
-            if first_chunk:
-    if skip_bytes > 0:
-        chunk = chunk[skip_bytes:]
-    first_chunk = False
+            if first_chunk and skip_bytes > 0:
+                chunk = chunk[skip_bytes:]
+                first_chunk = False
 
             # Don't send more than requested
             remaining = content_length - bytes_sent
@@ -142,7 +138,7 @@ async def handle_download(request):
             end = int(parts[1]) if parts[1] else file_size - 1
 
         content_length = end - start + 1
-        offset = max(0, start // CHUNK_SIZE)
+        offset = start // CHUNK_SIZE
         skip_bytes = start % CHUNK_SIZE
 
         headers = {
@@ -163,11 +159,9 @@ async def handle_download(request):
         first_chunk = True
 
         async for chunk in app.stream_media(msg, offset=offset):
-            if first_chunk:
-    if skip_bytes > 0:
-        chunk = chunk[skip_bytes:]
-    first_chunk = False
-
+            if first_chunk and skip_bytes > 0:
+                chunk = chunk[skip_bytes:]
+                first_chunk = False
 
             remaining = content_length - bytes_sent
             if len(chunk) > remaining:
@@ -274,4 +268,5 @@ async def start_services():
 
 if __name__ == "__main__":
     asyncio.get_event_loop().run_until_complete(start_services())
+
     
